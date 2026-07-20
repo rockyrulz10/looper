@@ -33,6 +33,9 @@ function encodeWav(float32Array, sampleRate) {
   return new Blob([view], { type: 'audio/wav' });
 }
 
+// Accent colors cycled across tracks (dot, waveform tint, sliders).
+const TRACK_PALETTE = ['#6ee7ff', '#f0abfc', '#86efac', '#fcd34d', '#fda4af', '#a5b4fc', '#5eead4', '#fdba74'];
+
 // ---------------------------------------------------------------------------
 // Track — one loopable recording with its own trim (loopStart/loopEnd),
 // volume, mute and solo state.
@@ -840,14 +843,17 @@ class WaveformEditor {
     ctx.fillRect(0, 0, w, h);
     if (!track.buffer) return;
 
+    const accent = track.color || '#6ee7ff';
     const data = track.buffer.getChannelData(0);
     const step = Math.max(1, Math.floor(data.length / w));
     const mid = h / 2;
     const startX = this.timeToX(track.loopStart);
     const endX = this.timeToX(track.loopEnd);
 
-    ctx.fillStyle = 'rgba(125,211,252,0.16)';
+    ctx.globalAlpha = 0.14;
+    ctx.fillStyle = accent;
     ctx.fillRect(startX, 0, endX - startX, h);
+    ctx.globalAlpha = 1;
 
     for (let x = 0; x < w; x++) {
       let min = 1;
@@ -862,7 +868,7 @@ class WaveformEditor {
       }
       if (min > max) { min = 0; max = 0; }
       const inRegion = x >= startX && x <= endX;
-      ctx.strokeStyle = inRegion ? '#93c5fd' : '#475569';
+      ctx.strokeStyle = inRegion ? accent : '#475569';
       ctx.beginPath();
       ctx.moveTo(x + 0.5, mid + min * mid * 0.92);
       ctx.lineTo(x + 0.5, mid + max * mid * 0.92);
@@ -942,14 +948,27 @@ class LooperApp {
   }
 
   // Redraws waveforms each frame while anything is playing so the seeker
-  // sweeps along; does one final pass after playback stops to clear it.
+  // sweeps along, drives the cycle-progress ring around the record button,
+  // and keeps the play/stop button in sync with actual engine state.
   _startSeekerLoop() {
     let wasPlaying = false;
+    const ringFg = document.getElementById('ringFg');
+    const CIRC = 2 * Math.PI * 46; // matches the SVG circle radius
     const tick = () => {
-      const playing = this.engine.tracks.some((t) => t.sourceNode);
+      const e = this.engine;
+      const playing = e.tracks.some((t) => t.sourceNode);
       if (playing || wasPlaying) {
         this.trackViews.forEach((v) => v.editor.draw());
+        this.updatePlayStopButton();
       }
+      let p = 0;
+      if (playing && e.timelineStart != null && e.audioContext) {
+        const L = e.masterLen();
+        if (L > 0) {
+          p = ((((e.audioContext.currentTime - e.timelineStart) % L) + L) % L) / L;
+        }
+      }
+      ringFg.style.strokeDashoffset = String(CIRC * (1 - p));
       wasPlaying = playing;
       requestAnimationFrame(tick);
     };
@@ -959,28 +978,68 @@ class LooperApp {
   bindGlobalEvents() {
     document.getElementById('btnEnable').addEventListener('click', () => this.ensureStarted());
     document.getElementById('btnRecord').addEventListener('click', () => this.toggleRecord());
-    document.getElementById('btnPlayAll').addEventListener('click', () => this.engine.playAll());
-    document.getElementById('btnStopAll').addEventListener('click', () => this.engine.stopAll());
-    document.getElementById('btnClear').addEventListener('click', () => this.clearSession());
-    document.getElementById('btnFixAudio').addEventListener('click', async () => {
+
+    document.getElementById('btnPlayStop').addEventListener('click', async () => {
+      await this.ensureStarted();
+      if (this.engine.anyPlaying()) this.engine.stopAll();
+      else this.engine.playAll();
+      this.updatePlayStopButton();
+    });
+
+    const menu = document.getElementById('menu');
+    const closeMenu = () => menu.classList.add('hidden');
+    document.getElementById('btnMenu').addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      menu.classList.toggle('hidden');
+    });
+    document.addEventListener('click', (ev) => {
+      if (!menu.classList.contains('hidden') && !menu.contains(ev.target)) closeMenu();
+    });
+
+    const fileInput = document.getElementById('fileImport');
+    const openImport = async () => {
+      closeMenu();
+      await this.ensureStarted();
+      fileInput.click();
+    };
+    document.getElementById('menuImport').addEventListener('click', openImport);
+    document.getElementById('emptyImport').addEventListener('click', openImport);
+    document.getElementById('menuFix').addEventListener('click', async () => {
+      closeMenu();
       await this.ensureStarted();
       await this.engine.recoverAudio();
       this.flashMessage('Audio path rebuilt');
     });
-
-    const fileInput = document.getElementById('fileImport');
-    document.getElementById('btnImport').addEventListener('click', async () => {
-      await this.ensureStarted();
-      fileInput.click();
+    document.getElementById('menuClear').addEventListener('click', () => {
+      closeMenu();
+      this.clearSession();
     });
+
     fileInput.addEventListener('change', async () => {
       const files = Array.from(fileInput.files || []);
       fileInput.value = '';
       if (files.length) await this.importFiles(files);
     });
+
+    // Diagnostics are hidden by default — tap the version badge to peek.
+    document.getElementById('versionBadge').addEventListener('click', () => {
+      document.getElementById('diag').classList.toggle('hidden');
+    });
+
     window.addEventListener('resize', () => {
       this.trackViews.forEach((v) => v.editor.resizeAndDraw());
     });
+  }
+
+  updatePlayStopButton() {
+    const b = document.getElementById('btnPlayStop');
+    const playing = this.engine.anyPlaying();
+    b.textContent = playing ? '■' : '▶';
+    b.classList.toggle('active', playing);
+  }
+
+  updateEmptyState() {
+    document.getElementById('emptyState').classList.toggle('hidden', this.trackViews.size > 0);
   }
 
   async ensureStarted() {
@@ -1026,17 +1085,20 @@ class LooperApp {
     }
     const btn = document.getElementById('btnRecord');
 
+    const transport = document.getElementById('transport');
     if (!this.isRecording) {
       const track = this.engine.createTrack();
       this._pendingTrack = track;
       this.isRecording = true;
       btn.classList.add('recording');
+      transport.classList.add('rec');
       btn.setAttribute('aria-label', 'Stop recording');
       try {
         await this.engine.startRecording(track);
       } catch (err) {
         this.isRecording = false;
         btn.classList.remove('recording');
+        transport.classList.remove('rec');
         btn.setAttribute('aria-label', 'Start recording');
         this.engine.removeTrack(track);
         this._pendingTrack = null;
@@ -1044,6 +1106,7 @@ class LooperApp {
       }
     } else {
       btn.classList.remove('recording');
+      transport.classList.remove('rec');
       btn.setAttribute('aria-label', 'Start recording');
       this.isRecording = false;
       const track = await this.engine.stopRecording();
@@ -1128,7 +1191,12 @@ class LooperApp {
     const node = this.trackTemplate.content.firstElementChild.cloneNode(true);
     this.trackListEl.appendChild(node);
 
+    track.color = TRACK_PALETTE[track.order % TRACK_PALETTE.length];
+    node.style.setProperty('--tcolor', track.color);
+
     const nameInput = node.querySelector('.track-name');
+    const lenEl = node.querySelector('.track-len');
+    const expandBtn = node.querySelector('.btn-expand');
     const muteBtn = node.querySelector('.btn-mute');
     const soloBtn = node.querySelector('.btn-solo');
     const deleteBtn = node.querySelector('.btn-delete');
@@ -1150,6 +1218,10 @@ class LooperApp {
     fadeSlider.value = track.fade;
     repeatSel.value = String(track.repeat);
 
+    const updateInfo = () => {
+      this.updateLoopInfo(infoEl, track);
+      lenEl.textContent = `${(track.loopEnd - track.loopStart).toFixed(2)}s`;
+    };
     const updateOffsetInfo = () => {
       offsetInfo.textContent = `@${track.offset.toFixed(2)}s`;
     };
@@ -1171,7 +1243,7 @@ class LooperApp {
     updateFadeInfo();
 
     const editor = new WaveformEditor(canvas, track, (final) => {
-      this.updateLoopInfo(infoEl, track);
+      updateInfo();
       if (final) {
         this.cycleChanged(); // trimming can change the master cycle length
         this.persistTrack(track);
@@ -1181,7 +1253,10 @@ class LooperApp {
     this.trackViews.set(track.id, { root: node, editor, refreshTiming });
 
     requestAnimationFrame(() => editor.resizeAndDraw());
-    this.updateLoopInfo(infoEl, track);
+    updateInfo();
+    this.updateEmptyState();
+
+    expandBtn.addEventListener('click', () => node.classList.toggle('open'));
 
     nameInput.addEventListener('change', () => {
       track.name = nameInput.value || track.name;
@@ -1205,6 +1280,7 @@ class LooperApp {
       this.trackViews.delete(track.id);
       node.remove();
       this.cycleChanged();
+      this.updateEmptyState();
       Storage.deleteTrack(track.id).catch((e) => console.error(e));
     });
 
@@ -1228,7 +1304,7 @@ class LooperApp {
           track.setLoopPoints(track.loopStart, track.loopEnd + delta);
         }
         editor.draw();
-        this.updateLoopInfo(infoEl, track);
+        updateInfo();
         this.scheduleResync();
         this.schedulePersist(track);
       });
@@ -1267,7 +1343,7 @@ class LooperApp {
       track.setRepeat('fill');
       repeatSel.value = 'fill';
       editor.draw();
-      this.updateLoopInfo(infoEl, track);
+      updateInfo();
       this.cycleChanged();
       this.persistTrack(track);
     });
@@ -1394,6 +1470,8 @@ class LooperApp {
     for (const t of [...this.engine.tracks]) this.engine.removeTrack(t);
     this.trackListEl.innerHTML = '';
     this.trackViews.clear();
+    this.updateEmptyState();
+    this.updatePlayStopButton();
     await Storage.clearAll();
     this.flashMessage('Session cleared');
   }

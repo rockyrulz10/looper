@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <title>Looper</title>
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
-  <meta name="theme-color" content="#0b0f14" />
+  <meta name="theme-color" content="#0a0d12" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="Looper" />
@@ -16,35 +16,49 @@
 <body>
   <div id="splash">
     <div class="splash-inner">
-      <h1>Looper <span class="app-version">v10</span></h1>
-      <p>Record loops with your iPhone mic. Playback goes to your connected output (e.g. Bluetooth speaker). While recording, iOS briefly switches audio routes; it returns to your Bluetooth output as soon as you stop.</p>
-      <button id="btnEnable" class="btn-primary">Tap to Start</button>
-      <p class="splash-hint">You'll be asked for microphone access the first time you record.</p>
+      <div class="splash-logo">◉</div>
+      <h1>Looper <span class="app-version">v11</span></h1>
+      <p>Record. Layer. Loop.</p>
+      <button id="btnEnable" class="btn-primary">Start</button>
+      <p class="splash-hint">Microphone access is requested on your first recording.</p>
       <p id="splashError" class="splash-error"></p>
     </div>
   </div>
 
   <header class="app-header">
-    <h1>Looper <span class="app-version">v10</span></h1>
+    <h1>Looper <span class="app-version" id="versionBadge">v11</span></h1>
     <div class="header-actions">
-      <button id="btnPlayAll" class="btn-icon" aria-label="Play all">▶ Play All</button>
-      <button id="btnStopAll" class="btn-icon" aria-label="Stop all">■ Stop All</button>
-      <button id="btnImport" class="btn-icon" aria-label="Import audio file">⭱ Import</button>
-      <button id="btnFixAudio" class="btn-icon" aria-label="Fix audio routing" title="Rebuild the audio path if sound is stuck on the wrong output">↻ Audio</button>
-      <button id="btnClear" class="btn-icon btn-danger" aria-label="Clear session">Clear</button>
+      <button id="btnPlayStop" class="btn-icon btn-playstop" aria-label="Play or stop all loops">▶</button>
+      <button id="btnMenu" class="btn-icon" aria-label="Menu">⋯</button>
+    </div>
+    <div id="menu" class="menu hidden">
+      <button id="menuImport">⭱&nbsp; Import audio</button>
+      <button id="menuFix">↻&nbsp; Fix audio</button>
+      <button id="menuClear" class="menu-danger">✕&nbsp; Clear session</button>
     </div>
     <input type="file" id="fileImport" accept="audio/*,.mp3,.m4a,.aac,.wav,.ogg,.flac" multiple hidden />
   </header>
 
   <main id="trackList" class="track-list"></main>
 
-  <footer class="transport">
+  <div id="emptyState" class="empty-state">
+    <div class="empty-icon">◉</div>
+    <p>Tap the button below to record<br />your first loop</p>
+    <button id="emptyImport" class="btn-link">or import an audio file</button>
+  </div>
+
+  <footer class="transport" id="transport">
     <div class="level-meter"><div id="levelMeterFill" class="level-meter-fill"></div></div>
-    <button id="btnRecord" class="btn-record" aria-label="Start recording">
-      <span class="btn-record-dot"></span>
-    </button>
-    <p class="transport-hint">Tap ● to record — other loops keep playing · Tap again to stop &amp; loop it</p>
-    <p id="diag" class="diag"></p>
+    <div class="rec-wrap">
+      <svg class="cycle-ring" viewBox="0 0 100 100" aria-hidden="true">
+        <circle class="ring-bg" cx="50" cy="50" r="46"></circle>
+        <circle class="ring-fg" id="ringFg" cx="50" cy="50" r="46"></circle>
+      </svg>
+      <button id="btnRecord" class="btn-record" aria-label="Start recording">
+        <span class="btn-record-dot"></span>
+      </button>
+    </div>
+    <p id="diag" class="diag hidden"></p>
   </footer>
 
   <div id="toast" class="toast"></div>
@@ -56,61 +70,66 @@
 
   <template id="trackTemplate">
     <section class="track-card">
-      <div class="track-header">
+      <div class="track-top">
+        <span class="track-dot"></span>
         <input class="track-name" type="text" maxlength="30" />
-        <div class="track-header-buttons">
-          <button class="btn-chip btn-solo" title="Solo">S</button>
-          <button class="btn-chip btn-mute" title="Mute">M</button>
-          <button class="btn-chip btn-download" title="Download WAV">⭳</button>
-          <button class="btn-chip btn-delete" title="Delete">✕</button>
-        </div>
+        <span class="track-len"></span>
+        <button class="btn-chip btn-mute" title="Mute">M</button>
+        <button class="btn-chip btn-solo" title="Solo">S</button>
+        <button class="btn-chip btn-expand" title="Track settings" aria-label="Track settings">▾</button>
       </div>
       <canvas class="track-waveform"></canvas>
-      <p class="track-hint">Drag the yellow handles to trim · drag the middle to slide the loop</p>
-      <div class="track-loop-row">
-        <div class="nudge-group" aria-label="Fine-trim loop start">
-          <span class="nudge-label">Start</span>
-          <button class="nudge" data-edge="start" data-delta="-0.01" aria-label="Start earlier">−</button>
-          <button class="nudge" data-edge="start" data-delta="0.01" aria-label="Start later">+</button>
+      <div class="track-details">
+        <div class="track-loop-row">
+          <div class="nudge-group" aria-label="Fine-trim loop start">
+            <span class="nudge-label">Start</span>
+            <button class="nudge" data-edge="start" data-delta="-0.01" aria-label="Start earlier">−</button>
+            <button class="nudge" data-edge="start" data-delta="0.01" aria-label="Start later">+</button>
+          </div>
+          <div class="track-loop-info"></div>
+          <div class="nudge-group" aria-label="Fine-trim loop end">
+            <span class="nudge-label">End</span>
+            <button class="nudge" data-edge="end" data-delta="-0.01" aria-label="End earlier">−</button>
+            <button class="nudge" data-edge="end" data-delta="0.01" aria-label="End later">+</button>
+          </div>
         </div>
-        <div class="track-loop-info"></div>
-        <div class="nudge-group" aria-label="Fine-trim loop end">
-          <span class="nudge-label">End</span>
-          <button class="nudge" data-edge="end" data-delta="-0.01" aria-label="End earlier">−</button>
-          <button class="nudge" data-edge="end" data-delta="0.01" aria-label="End later">+</button>
+        <div class="track-timing-row">
+          <div class="pos-group" aria-label="Where in the master cycle this loop plays">
+            <span class="nudge-label">Place</span>
+            <button class="nudge" data-edge="offset" data-delta="-0.01" title="0.01s earlier">◀</button>
+            <input class="track-pos" type="range" min="0" max="1" step="0.01" value="0" />
+            <button class="nudge" data-edge="offset" data-delta="0.01" title="0.01s later">▶</button>
+            <span class="track-offset-info">@0.00s</span>
+          </div>
         </div>
-      </div>
-      <div class="track-timing-row">
-        <div class="pos-group" aria-label="Where in the master cycle this loop plays">
-          <span class="nudge-label">Place</span>
-          <button class="nudge" data-edge="offset" data-delta="-0.01" title="0.01s earlier">◀</button>
-          <input class="track-pos" type="range" min="0" max="1" step="0.01" value="0" />
-          <button class="nudge" data-edge="offset" data-delta="0.01" title="0.01s later">▶</button>
-          <span class="track-offset-info">@0.00s</span>
+        <div class="track-timing-row">
+          <div class="nudge-group" aria-label="How many times this loop plays per cycle">
+            <span class="nudge-label">Repeat</span>
+            <select class="track-repeat">
+              <option value="fill">Fill cycle</option>
+              <option value="1">×1</option>
+              <option value="2">×2</option>
+              <option value="3">×3</option>
+              <option value="4">×4</option>
+              <option value="6">×6</option>
+              <option value="8">×8</option>
+            </select>
+          </div>
+          <div class="fade-group" aria-label="Crossfade at the loop seam">
+            <span class="nudge-label">Blend</span>
+            <input class="track-fade" type="range" min="0" max="0.2" step="0.005" />
+            <span class="track-fade-info">15ms</span>
+          </div>
         </div>
-      </div>
-      <div class="track-timing-row">
-        <div class="nudge-group" aria-label="How many times this loop plays per cycle">
-          <span class="nudge-label">Repeat</span>
-          <select class="track-repeat">
-            <option value="fill">Fill cycle</option>
-            <option value="1">×1</option>
-            <option value="2">×2</option>
-            <option value="3">×3</option>
-            <option value="4">×4</option>
-            <option value="6">×6</option>
-            <option value="8">×8</option>
-          </select>
+        <div class="track-footer">
+          <button class="btn-reset-loop">Reset</button>
+          <div class="vol-group">
+            <span class="nudge-label">Vol</span>
+            <input class="track-volume" type="range" min="0" max="1.5" step="0.01" value="1" />
+          </div>
+          <button class="btn-chip btn-download" title="Download WAV">⭳</button>
+          <button class="btn-chip btn-delete" title="Delete track">✕</button>
         </div>
-        <div class="fade-group" aria-label="Crossfade at the loop seam">
-          <span class="nudge-label">Blend</span>
-          <input class="track-fade" type="range" min="0" max="0.2" step="0.005" />
-          <span class="track-fade-info">15ms</span>
-        </div>
-      </div>
-      <div class="track-footer">
-        <button class="btn-reset-loop">Reset to full length</button>
-        <input class="track-volume" type="range" min="0" max="1.5" step="0.01" value="1" />
       </div>
     </section>
   </template>
