@@ -113,6 +113,23 @@ button {
   font-variant-numeric: tabular-nums;
 }
 .fade-group { display: flex; align-items: center; gap: 6px; }
+.pos-group { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; }
+.track-pos { flex: 1; min-width: 80px; }
+.track-repeat {
+  background: var(--surface-2);
+  color: inherit;
+  border: none;
+  border-radius: 6px;
+  padding: 5px 6px;
+  font-size: 0.75rem;
+}
+.diag {
+  font-size: 0.62rem;
+  color: #475569;
+  text-align: center;
+  margin: 4px 0 0;
+  font-variant-numeric: tabular-nums;
+}
 .track-fade { width: 84px; }
 .track-fade-info {
   font-size: 0.72rem;

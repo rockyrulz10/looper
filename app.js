@@ -51,11 +51,18 @@ class Track {
     this.volume = opts.volume ?? 1;
     this.muted = opts.muted ?? false;
     this.fade = opts.fade ?? 0.015; // crossfade length at the loop seam (s)
-    this.offset = opts.offset ?? 0; // start delay on the shared timeline (s)
+    this.offset = opts.offset ?? 0; // position within the master cycle (s)
+    this.repeat = opts.repeat ?? 'fill'; // 'fill' or a count: times to repeat per cycle
     this.solo = false;
     this.sourceNode = null;
-    this._proc = null; // rendered loop region with the crossfade baked in
+    // Rendered full-cycle buffer: the trimmed region (with seam crossfade)
+    // placed at `offset` and repeated per `repeat`, in a buffer exactly one
+    // master cycle long — so every track loops at the identical length.
+    this._proc = null;
     this._procDirty = true;
+    this._cycleSecs = 0;
+    this._regionSecs = 0;
+    this._reps = 0;
 
     this.gainNode = engine.audioContext.createGain();
     this.gainNode.gain.value = this.muted ? 0 : this.volume;
@@ -103,8 +110,32 @@ class Track {
       }
     }
 
-    this._proc = this.engine.audioContext.createBuffer(1, len, sr);
-    this._proc.copyToChannel(out, 0);
+    // Compose the full master cycle: this region placed at `offset`,
+    // repeated `repeat` times (or filling the cycle), wrapping at the end.
+    const regionSecs = len / sr;
+    const L = Math.max(this.engine.masterLen(), regionSecs);
+    const Lsamps = Math.max(1, Math.round(L * sr));
+    const cycle = new Float32Array(Lsamps);
+    const offSamps = Math.round(((this.offset % L) + L) % L * sr) % Lsamps;
+    const maxReps = Math.ceil(Lsamps / len);
+    const reps = this.repeat === 'fill'
+      ? maxReps
+      : Math.min(Math.max(1, parseInt(this.repeat, 10) || 1), maxReps);
+    for (let k = 0; k < reps; k++) {
+      const placed = k * len;
+      if (placed >= Lsamps) break;
+      const copyLen = Math.min(len, Lsamps - placed);
+      const pos = (offSamps + placed) % Lsamps;
+      const first = Math.min(copyLen, Lsamps - pos);
+      cycle.set(out.subarray(0, first), pos);
+      if (copyLen > first) cycle.set(out.subarray(first, copyLen), 0);
+    }
+
+    this._proc = this.engine.audioContext.createBuffer(1, Lsamps, sr);
+    this._proc.copyToChannel(cycle, 0);
+    this._cycleSecs = L;
+    this._regionSecs = regionSecs;
+    this._reps = reps;
     this._procDirty = false;
   }
 
@@ -122,29 +153,31 @@ class Track {
     src.buffer = proc;
     src.loop = true;
     src.loopStart = 0;
-    src.loopEnd = proc.duration;
+    // Loop at the exact cycle length in seconds (fractional-sample looping),
+    // so every track wraps at the identical instant — zero long-term drift.
+    src.loopEnd = this._cycleSecs;
     src.connect(this.gainNode);
-    src.start(when, Math.max(0, Math.min(phase, proc.duration - 0.001)));
+    src.start(when, Math.max(0, Math.min(phase, this._cycleSecs - 0.001)));
     this.sourceNode = src;
     this._startedAt = when - phase;
   }
 
-  // Start (or restart) aligned to the engine's shared timeline, honouring
-  // this track's offset — so loops started at different moments line up.
+  // Start (or restart) locked to the engine's shared cycle. Every track's
+  // buffer is a full cycle (position/repeats baked in), so alignment is just
+  // joining at the current cycle phase.
   playSynced() {
     if (!this.buffer) return;
     const engine = this.engine;
     const ctx = engine.audioContext;
     const proc = this._procBuffer();
     if (!proc) return;
-    if (engine.timelineStart == null) engine.timelineStart = ctx.currentTime + 0.05;
-    const due = engine.timelineStart + this.offset;
+    if (engine.timelineStart == null) engine.setTimeline(ctx.currentTime + 0.05);
     const now = ctx.currentTime;
-    if (due > now + 0.02) {
-      this.play(due); // not due yet — schedule the future entry
+    if (engine.timelineStart > now + 0.02) {
+      this.play(engine.timelineStart);
     } else {
-      const phase = (now + 0.03 - due) % proc.duration;
-      this.play(now + 0.03, phase); // join mid-loop at the aligned position
+      const phase = (((now + 0.03 - engine.timelineStart) % this._cycleSecs) + this._cycleSecs) % this._cycleSecs;
+      this.play(now + 0.03, phase);
     }
   }
 
@@ -157,15 +190,21 @@ class Track {
     }
   }
 
-  // Current playback position in buffer time, or null when not playing.
+  // Current playback position in buffer time for the seeker, or null when
+  // not playing or in a silent gap of the cycle (between repeats).
   playheadTime() {
     if (!this.sourceNode || this._startedAt == null) return null;
-    const proc = this._proc;
-    const len = proc ? proc.duration : this.loopEnd - this.loopStart;
-    if (len <= 0) return this.loopStart;
+    const L = this._cycleSecs;
+    const len = this._regionSecs;
+    if (L <= 0 || len <= 0) return this.loopStart;
     let elapsed = this.engine.audioContext.currentTime - this._startedAt;
     if (elapsed < 0) elapsed = 0; // scheduled but not started yet
-    return this.loopStart + (elapsed % len);
+    const cyclePos = elapsed % L;
+    const off = ((this.offset % L) + L) % L;
+    const rel = ((cyclePos - off) % L + L) % L;
+    const k = Math.floor(rel / len);
+    if (k >= this._reps) return null; // in the silence between repeats
+    return this.loopStart + (rel - k * len);
   }
 
   setLoopPoints(start, end) {
@@ -185,7 +224,15 @@ class Track {
   }
 
   setOffset(o) {
-    this.offset = Math.max(0, Math.round(o * 1000) / 1000);
+    const L = this.engine.masterLen();
+    o = Math.round(o * 1000) / 1000;
+    this.offset = L > 0 ? ((o % L) + L) % L : Math.max(0, o);
+    this._procDirty = true; // position is baked into the cycle buffer
+  }
+
+  setRepeat(r) {
+    this.repeat = r === 'fill' ? 'fill' : Math.max(1, parseInt(r, 10) || 1);
+    this._procDirty = true;
   }
 
   setVolume(v) {
@@ -223,6 +270,7 @@ class Track {
       muted: this.muted,
       fade: this.fade,
       offset: this.offset,
+      repeat: this.repeat,
     };
   }
 }
@@ -236,7 +284,10 @@ class AudioEngine {
     this.masterGain = null;
     this.micStream = null;
     this.tracks = [];
-    this.timelineStart = null; // shared epoch that track offsets align to
+    this.timelineStart = null; // shared cycle epoch (playback-context time)
+    this._timelineWall = null; // same epoch in wall-clock ms — survives context rebuilds
+    this._stallTicks = 0;
+    this._rebuilding = false;
     this.recordingTrack = null;
     this.recordedChunks = [];
     this.recordedLength = 0;
@@ -297,7 +348,7 @@ class AudioEngine {
     await this._rebuildGraph();
     this._ensureOutput();
     if (playing.length) {
-      this.timelineStart = this.audioContext.currentTime + 0.05;
+      if (this.timelineStart == null) this.setTimeline(this.audioContext.currentTime + 0.05);
       playing.forEach((t) => t.playSynced());
     }
   }
@@ -329,7 +380,11 @@ class AudioEngine {
       try { old.onstatechange = null; if (old.state !== 'closed') await old.close(); } catch (e) { /* noop */ }
     }
     await this._createGraph();
-    this.timelineStart = null;
+    // Restore the cycle epoch in the new context's timebase via the
+    // wall-clock anchor so playback rejoins at the same phase.
+    this.timelineStart = this._timelineWall != null
+      ? this.audioContext.currentTime + (this._timelineWall - Date.now()) / 1000
+      : null;
     for (const t of this.tracks) {
       t.sourceNode = null;
       t._proc = null;
@@ -503,8 +558,29 @@ class AudioEngine {
     this.recordingTrack = track;
     this._captureNode.port.postMessage('start');
     // iOS route flips when the mic opens can suspend the PLAYBACK context —
-    // keep kicking it so existing loops keep playing under the overdub.
-    this._recWatchdog = setInterval(() => this._ensureOutput(), 300);
+    // keep kicking it so existing loops keep playing under the overdub. If
+    // resume() fails for ~1s the context is wedged: rebuild playback outright
+    // (capture is a separate context and keeps recording through this), and
+    // rejoin the loops at the preserved cycle phase.
+    this._stallTicks = 0;
+    this._recWatchdog = setInterval(async () => {
+      this._ensureOutput();
+      if (this.audioContext.state !== 'running') {
+        this._stallTicks++;
+        if (this._stallTicks >= 3 && !this._rebuilding) {
+          this._rebuilding = true;
+          const playing = this.tracks.filter((t) => t.sourceNode);
+          try {
+            await this._rebuildGraph();
+            playing.forEach((t) => t.playSynced());
+          } catch (e) { /* keep recording regardless */ }
+          this._rebuilding = false;
+          this._stallTicks = 0;
+        }
+      } else {
+        this._stallTicks = 0;
+      }
+    }, 300);
   }
 
   async stopRecording() {
@@ -548,21 +624,42 @@ class AudioEngine {
     return track;
   }
 
+  // Master cycle length = the longest track's loop region.
+  masterLen() {
+    let L = 0;
+    for (const t of this.tracks) {
+      if (t.buffer) L = Math.max(L, t.loopEnd - t.loopStart);
+    }
+    return L;
+  }
+
+  setTimeline(when) {
+    this.timelineStart = when;
+    this._timelineWall = Date.now() + (when - this.audioContext.currentTime) * 1000;
+  }
+
+  // Re-render every track's cycle buffer (cycle length or placement changed)
+  // and re-join the playing ones at the current phase.
+  resyncAll() {
+    this.tracks.forEach((t) => { t._procDirty = true; });
+    this.tracks.filter((t) => t.sourceNode).forEach((t) => t.playSynced());
+  }
+
   playAll() {
     this._ensureOutput();
-    // Fresh shared timeline: every track enters at its own offset from here.
-    this.timelineStart = this.audioContext.currentTime + 0.05;
+    this.setTimeline(this.audioContext.currentTime + 0.05);
     this.tracks.forEach((t) => t.playSynced());
   }
 
   playTrack(track) {
     this._ensureOutput();
-    track.playSynced(); // joins the running timeline (or starts one)
+    track.playSynced(); // joins the running cycle (or starts one)
   }
 
   stopAll() {
     this.tracks.forEach((t) => t.stop());
     this.timelineStart = null;
+    this._timelineWall = null;
   }
 
   removeTrack(track) {
@@ -862,7 +959,23 @@ class LooperApp {
     this.started = true;
     this.engine.onLevelUpdate = (level) => this.updateLevelMeter(level);
     document.getElementById('splash').classList.add('hidden');
+    this._startDiagnostics();
     await this.restoreSession();
+  }
+
+  // Live status line (tiny, bottom of the transport): shows what iOS is
+  // doing to the audio path so routing problems can be reported precisely.
+  _startDiagnostics() {
+    const el = document.getElementById('diag');
+    if (!el || this._diagTimer) return;
+    this._diagTimer = setInterval(() => {
+      const e = this.engine;
+      if (!e.audioContext) return;
+      const sess = 'audioSession' in navigator ? navigator.audioSession.type : 'n/a';
+      const rec = e.recordingTrack ? 'REC' : 'idle';
+      el.textContent =
+        `out:${e.audioContext.state} · ${rec} · session:${sess} · cycle:${e.masterLen().toFixed(2)}s`;
+    }, 500);
   }
 
   async toggleRecord() {
@@ -903,6 +1016,8 @@ class LooperApp {
       }
 
       this.addTrackView(track);
+      // A new longest take grows the master cycle for everyone.
+      this.cycleChanged();
       // Other loops were never interrupted — the new one just joins in.
       this.engine.playTrack(track);
       this.persistTrack(track);
@@ -941,6 +1056,7 @@ class LooperApp {
       }
     }
     if (imported) {
+      this.cycleChanged();
       this.flashMessage(`Imported ${imported} file(s) — trim the loop region, then hit play`);
     }
   }
@@ -983,34 +1099,44 @@ class LooperApp {
     const offsetInfo = node.querySelector('.track-offset-info');
     const fadeSlider = node.querySelector('.track-fade');
     const fadeInfo = node.querySelector('.track-fade-info');
+    const posSlider = node.querySelector('.track-pos');
+    const repeatSel = node.querySelector('.track-repeat');
 
     nameInput.value = track.name;
     volumeSlider.value = track.volume;
     if (track.muted) muteBtn.classList.add('active');
     fadeSlider.value = track.fade;
+    repeatSel.value = String(track.repeat);
 
     const updateOffsetInfo = () => {
-      offsetInfo.textContent = `+${track.offset.toFixed(2)}s`;
+      offsetInfo.textContent = `@${track.offset.toFixed(2)}s`;
     };
     const updateFadeInfo = () => {
       fadeInfo.textContent = `${Math.round(track.fade * 1000)}ms`;
     };
-    // Re-align a playing track after its loop region, blend or shift changed.
+    // Keep the Place slider spanning the current master cycle length.
+    const refreshTiming = () => {
+      const L = Math.max(this.engine.masterLen(), 0.01);
+      posSlider.max = L.toFixed(2);
+      if (!this._draggingPos) posSlider.value = Math.min(track.offset, L);
+      updateOffsetInfo();
+    };
+    // Re-render + re-join a playing track after its placement/blend changed.
     const resync = () => {
       if (track.sourceNode) track.playSynced();
     };
-    updateOffsetInfo();
+    refreshTiming();
     updateFadeInfo();
 
     const editor = new WaveformEditor(canvas, track, (final) => {
       this.updateLoopInfo(infoEl, track);
       if (final) {
-        resync();
+        this.cycleChanged(); // trimming can change the master cycle length
         this.persistTrack(track);
       }
     });
 
-    this.trackViews.set(track.id, { root: node, editor });
+    this.trackViews.set(track.id, { root: node, editor, refreshTiming });
 
     requestAnimationFrame(() => editor.resizeAndDraw());
     this.updateLoopInfo(infoEl, track);
@@ -1036,6 +1162,7 @@ class LooperApp {
       this.engine.removeTrack(track);
       this.trackViews.delete(track.id);
       node.remove();
+      this.cycleChanged();
       Storage.deleteTrack(track.id).catch((e) => console.error(e));
     });
 
@@ -1052,17 +1179,37 @@ class LooperApp {
         const delta = parseFloat(btn.dataset.delta);
         if (edge === 'offset') {
           track.setOffset(track.offset + delta);
-          updateOffsetInfo();
+          refreshTiming();
+          resync();
         } else if (edge === 'start') {
           track.setLoopPoints(track.loopStart + delta, track.loopEnd);
+          this.cycleChanged();
         } else {
           track.setLoopPoints(track.loopStart, track.loopEnd + delta);
+          this.cycleChanged();
         }
         editor.draw();
         this.updateLoopInfo(infoEl, track);
-        resync();
         this.persistTrack(track);
       });
+    });
+
+    posSlider.addEventListener('input', () => {
+      this._draggingPos = true;
+      offsetInfo.textContent = `@${parseFloat(posSlider.value).toFixed(2)}s`;
+    });
+    posSlider.addEventListener('change', () => {
+      this._draggingPos = false;
+      track.setOffset(parseFloat(posSlider.value));
+      refreshTiming();
+      resync();
+      this.persistTrack(track);
+    });
+
+    repeatSel.addEventListener('change', () => {
+      track.setRepeat(repeatSel.value);
+      resync();
+      this.persistTrack(track);
     });
 
     fadeSlider.addEventListener('input', () => {
@@ -1077,12 +1224,20 @@ class LooperApp {
     resetBtn.addEventListener('click', () => {
       track.setLoopPoints(0, track.buffer.duration);
       track.setOffset(0);
-      updateOffsetInfo();
+      track.setRepeat('fill');
+      repeatSel.value = 'fill';
       editor.draw();
       this.updateLoopInfo(infoEl, track);
-      resync();
+      this.cycleChanged();
       this.persistTrack(track);
     });
+  }
+
+  // Anything that can alter the master cycle length (add/remove/trim a
+  // track) re-renders all cycle buffers and refreshes every Place slider.
+  cycleChanged() {
+    this.engine.resyncAll();
+    this.trackViews.forEach((v) => v.refreshTiming && v.refreshTiming());
   }
 
   updateLoopInfo(infoEl, track) {
@@ -1123,6 +1278,7 @@ class LooperApp {
         muted: rec.muted,
         fade: rec.fade,
         offset: rec.offset,
+        repeat: rec.repeat,
       });
       const floatArr = new Float32Array(rec.channelData);
       const buf = this.engine.audioContext.createBuffer(1, Math.max(1, floatArr.length), rec.sampleRate);
@@ -1134,7 +1290,10 @@ class LooperApp {
       this.engine.tracks.push(track);
       this.addTrackView(track);
     }
-    if (records.length) this.flashMessage(`Restored ${records.length} track(s)`);
+    if (records.length) {
+      this.cycleChanged();
+      this.flashMessage(`Restored ${records.length} track(s)`);
+    }
   }
 
   async clearSession() {

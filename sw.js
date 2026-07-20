@@ -1,4 +1,4 @@
-const CACHE_NAME = 'looper-cache-v8';
+const CACHE_NAME = 'looper-cache-v9';
 const ASSETS = [
   './',
   './index.html',

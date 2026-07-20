@@ -16,7 +16,7 @@
 <body>
   <div id="splash">
     <div class="splash-inner">
-      <h1>Looper <span class="app-version">v8</span></h1>
+      <h1>Looper <span class="app-version">v9</span></h1>
       <p>Record loops with your iPhone mic. Playback goes to your connected output (e.g. Bluetooth speaker). While recording, iOS briefly switches audio routes; it returns to your Bluetooth output as soon as you stop.</p>
       <button id="btnEnable" class="btn-primary">Tap to Start</button>
       <p class="splash-hint">You'll be asked for microphone access the first time you record.</p>
@@ -25,7 +25,7 @@
   </div>
 
   <header class="app-header">
-    <h1>Looper <span class="app-version">v8</span></h1>
+    <h1>Looper <span class="app-version">v9</span></h1>
     <div class="header-actions">
       <button id="btnPlayAll" class="btn-icon" aria-label="Play all">▶ Play All</button>
       <button id="btnStopAll" class="btn-icon" aria-label="Stop all">■ Stop All</button>
@@ -44,6 +44,7 @@
       <span class="btn-record-dot"></span>
     </button>
     <p class="transport-hint">Tap ● to record — other loops keep playing · Tap again to stop &amp; loop it</p>
+    <p id="diag" class="diag"></p>
   </footer>
 
   <div id="toast" class="toast"></div>
@@ -80,13 +81,26 @@
         </div>
       </div>
       <div class="track-timing-row">
-        <div class="nudge-group" aria-label="Shift when this loop plays relative to the others">
-          <span class="nudge-label">Shift</span>
-          <button class="nudge" data-edge="offset" data-delta="-0.1" title="Play 0.1s earlier">◀◀</button>
-          <button class="nudge" data-edge="offset" data-delta="-0.01" title="Play 0.01s earlier">◀</button>
-          <span class="track-offset-info">+0.00s</span>
-          <button class="nudge" data-edge="offset" data-delta="0.01" title="Play 0.01s later">▶</button>
-          <button class="nudge" data-edge="offset" data-delta="0.1" title="Play 0.1s later">▶▶</button>
+        <div class="pos-group" aria-label="Where in the master cycle this loop plays">
+          <span class="nudge-label">Place</span>
+          <button class="nudge" data-edge="offset" data-delta="-0.01" title="0.01s earlier">◀</button>
+          <input class="track-pos" type="range" min="0" max="1" step="0.01" value="0" />
+          <button class="nudge" data-edge="offset" data-delta="0.01" title="0.01s later">▶</button>
+          <span class="track-offset-info">@0.00s</span>
+        </div>
+      </div>
+      <div class="track-timing-row">
+        <div class="nudge-group" aria-label="How many times this loop plays per cycle">
+          <span class="nudge-label">Repeat</span>
+          <select class="track-repeat">
+            <option value="fill">Fill cycle</option>
+            <option value="1">×1</option>
+            <option value="2">×2</option>
+            <option value="3">×3</option>
+            <option value="4">×4</option>
+            <option value="6">×6</option>
+            <option value="8">×8</option>
+          </select>
         </div>
         <div class="fade-group" aria-label="Crossfade at the loop seam">
           <span class="nudge-label">Blend</span>
