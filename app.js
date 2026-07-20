@@ -76,13 +76,13 @@ class Track {
     this._procDirty = true;
   }
 
-  // Render the loop region into its own buffer with the seam crossfade baked
-  // in (an AudioBufferSourceNode can't crossfade its own loop wrap). The head
-  // is blended equal-power with the audio that follows the loop end — or the
-  // tail with the audio before the loop start — so the wrap is seamless; if
-  // no material exists outside the region, fall back to short declick fades.
-  _rebuildProc() {
-    if (!this.buffer) { this._proc = null; return; }
+  // The trimmed region with the seam crossfade baked in: the head is blended
+  // equal-power with the audio following the loop end (or the tail with the
+  // audio before the start) so continuous repetition is seamless; with no
+  // material outside the region, short declick fades are used instead.
+  // Also used for WAV export, so downloads are the region — not a whole
+  // cycle of mostly silence.
+  _renderRegion() {
     const sr = this.buffer.sampleRate;
     const data = this.buffer.getChannelData(0);
     const s = Math.max(0, Math.floor(this.loopStart * sr));
@@ -109,6 +109,13 @@ class Track {
         }
       }
     }
+    return { out, sr };
+  }
+
+  _rebuildProc() {
+    if (!this.buffer) { this._proc = null; return; }
+    const { out, sr } = this._renderRegion();
+    const len = out.length;
 
     // Compose the full master cycle: this region placed at `offset`,
     // repeated `repeat` times (or filling the cycle), wrapping at the end.
@@ -121,6 +128,7 @@ class Track {
     const reps = this.repeat === 'fill'
       ? maxReps
       : Math.min(Math.max(1, parseInt(this.repeat, 10) || 1), maxReps);
+    let totalPlaced = 0;
     for (let k = 0; k < reps; k++) {
       const placed = k * len;
       if (placed >= Lsamps) break;
@@ -129,6 +137,23 @@ class Track {
       const first = Math.min(copyLen, Lsamps - pos);
       cycle.set(out.subarray(0, first), pos);
       if (copyLen > first) cycle.set(out.subarray(first, copyLen), 0);
+      totalPlaced = placed + copyLen;
+    }
+
+    // Declick: the region's crossfaded edges are full-amplitude (designed
+    // for continuous looping), so wherever a repeat starts/ends against
+    // silence — or at the fill-truncation seam — splice pops occur. Ramp
+    // ~4ms at those outer edges. A perfectly periodic fill needs none.
+    const periodic = Lsamps % len === 0 && totalPlaced === Lsamps;
+    const edge = Math.min(Math.round(0.004 * sr), Math.floor(len / 4));
+    if (!periodic && edge > 2 && totalPlaced > 0) {
+      for (let j = 0; j < edge; j++) {
+        const g = j / edge;
+        // fade-in at the first repeat's start
+        cycle[(offSamps + j) % Lsamps] *= g;
+        // fade-out at the last repeat's end
+        cycle[(offSamps + totalPlaced - 1 - j + Lsamps) % Lsamps] *= g;
+      }
     }
 
     this._proc = this.engine.audioContext.createBuffer(1, Lsamps, sr);
@@ -344,7 +369,8 @@ class AudioEngine {
   // wedges the route in call mode despite everything.
   async recoverAudio() {
     const playing = this.tracks.filter((t) => t.sourceNode);
-    this._releaseMic();
+    // Never yank the mic mid-take — only rebuild the playback side then.
+    if (!this.recordingTrack) this._releaseMic();
     await this._rebuildGraph();
     this._ensureOutput();
     if (playing.length) {
@@ -556,6 +582,12 @@ class AudioEngine {
     this.recordedChunks = [];
     this.recordedLength = 0;
     this.recordingTrack = track;
+    // Remember WHERE in the running cycle this take began, so the new loop
+    // defaults to playing back at the position it was performed at.
+    const L = this.masterLen();
+    this._recStartOffset = (this.timelineStart != null && L > 0)
+      ? (((this.audioContext.currentTime - this.timelineStart) % L) + L) % L
+      : null;
     this._captureNode.port.postMessage('start');
     // iOS route flips when the mic opens can suspend the PLAYBACK context —
     // keep kicking it so existing loops keep playing under the overdub. If
@@ -620,7 +652,15 @@ class AudioEngine {
       recSampleRate
     );
     audioBuffer.copyToChannel(merged, 0);
+    const lenBefore = this.masterLen(); // cycle length set by OTHER tracks
     track.setBuffer(audioBuffer);
+    // An overdub shorter than the cycle lands where it was performed; a take
+    // that becomes the new longest loop defines the cycle and starts at 0.
+    if (this._recStartOffset != null && lenBefore > 0 &&
+        track.loopEnd - track.loopStart < lenBefore) {
+      track.setOffset(this._recStartOffset);
+    }
+    this._recStartOffset = null;
     return track;
   }
 
@@ -1009,8 +1049,10 @@ class LooperApp {
       const track = await this.engine.stopRecording();
       this._pendingTrack = null;
 
-      if (!track || !track.buffer || track.buffer.duration < 0.12) {
-        if (track) this.engine.removeTrack(track);
+      // Track may have been deleted (Clear/Delete) while recording ran.
+      if (!track || !this.engine.tracks.includes(track)) return;
+      if (!track.buffer || track.buffer.duration < 0.12) {
+        this.engine.removeTrack(track);
         this.flashMessage('Recording too short — try again');
         return;
       }
@@ -1174,23 +1216,21 @@ class LooperApp {
     volumeSlider.addEventListener('change', () => this.persistTrack(track));
 
     nudges.forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const edge = btn.dataset.edge;
-        const delta = parseFloat(btn.dataset.delta);
+      const edge = btn.dataset.edge;
+      const delta = parseFloat(btn.dataset.delta);
+      this.bindHold(btn, () => {
         if (edge === 'offset') {
           track.setOffset(track.offset + delta);
           refreshTiming();
-          resync();
         } else if (edge === 'start') {
           track.setLoopPoints(track.loopStart + delta, track.loopEnd);
-          this.cycleChanged();
         } else {
           track.setLoopPoints(track.loopStart, track.loopEnd + delta);
-          this.cycleChanged();
         }
         editor.draw();
         this.updateLoopInfo(infoEl, track);
-        this.persistTrack(track);
+        this.scheduleResync();
+        this.schedulePersist(track);
       });
     });
 
@@ -1240,6 +1280,56 @@ class LooperApp {
     this.trackViews.forEach((v) => v.refreshTiming && v.refreshTiming());
   }
 
+  // Debounced flavour for rapid-fire adjustments (held nudge buttons):
+  // labels update instantly, the audio re-render lands once, 200ms after
+  // the last tap — no per-click glitching.
+  scheduleResync() {
+    clearTimeout(this._resyncTimer);
+    this._resyncTimer = setTimeout(() => this.cycleChanged(), 200);
+  }
+
+  schedulePersist(track) {
+    clearTimeout(track._persistTimer);
+    track._persistTimer = setTimeout(() => this.persistTrack(track), 400);
+  }
+
+  // Fire on tap, auto-repeat while held — fine 0.01s steps that still
+  // allow fast coarse moves.
+  bindHold(btn, fire) {
+    let holdTimer = null;
+    let repeatTimer = null;
+    let usedPointer = false;
+    btn.addEventListener('pointerdown', () => {
+      usedPointer = true;
+      let repeated = false;
+      // Single taps fire on RELEASE (so a scroll that starts on the button
+      // cancels cleanly instead of misfiring); holding fires repeatedly.
+      holdTimer = setTimeout(() => {
+        repeated = true;
+        fire();
+        repeatTimer = setInterval(fire, 110);
+      }, 380);
+      const cleanup = () => {
+        clearTimeout(holdTimer);
+        clearInterval(repeatTimer);
+        btn.removeEventListener('pointerup', tap);
+        window.removeEventListener('pointerup', cleanup);
+        window.removeEventListener('pointercancel', cleanup);
+      };
+      const tap = () => {
+        if (!repeated) fire();
+        cleanup();
+      };
+      btn.addEventListener('pointerup', tap);
+      window.addEventListener('pointerup', cleanup);
+      window.addEventListener('pointercancel', cleanup);
+    });
+    btn.addEventListener('click', (ev) => {
+      if (usedPointer) { usedPointer = false; ev.preventDefault(); return; }
+      fire(); // keyboard activation
+    });
+  }
+
   updateLoopInfo(infoEl, track) {
     const len = track.loopEnd - track.loopStart;
     infoEl.textContent = `${this.formatTime(track.loopStart)} – ${this.formatTime(track.loopEnd)}  (${this.formatTime(len)} loop)`;
@@ -1247,9 +1337,10 @@ class LooperApp {
 
   downloadTrackWav(track) {
     if (!track.buffer) return;
-    // Export the rendered loop (with the seam crossfade) — what you hear.
-    const proc = track._procBuffer();
-    const blob = encodeWav(proc.getChannelData(0), proc.sampleRate);
+    // Export the trimmed region with its crossfade — not the whole cycle,
+    // which for a sparsely placed loop would be mostly silence.
+    const { out, sr } = track._renderRegion();
+    const blob = encodeWav(out, sr);
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
