@@ -1,0 +1,6 @@
+# Local dev server certificates — never publish private keys
+certs/
+
+__pycache__/
+*.pyc
+.DS_Store

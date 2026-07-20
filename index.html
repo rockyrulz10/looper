@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Looper</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+  <meta name="theme-color" content="#0b0f14" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Looper" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <link rel="icon" href="icons/icon-192.png" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="splash">
+    <div class="splash-inner">
+      <h1>Looper <span class="app-version">v8</span></h1>
+      <p>Record loops with your iPhone mic. Playback goes to your connected output (e.g. Bluetooth speaker). While recording, iOS briefly switches audio routes; it returns to your Bluetooth output as soon as you stop.</p>
+      <button id="btnEnable" class="btn-primary">Tap to Start</button>
+      <p class="splash-hint">You'll be asked for microphone access the first time you record.</p>
+      <p id="splashError" class="splash-error"></p>
+    </div>
+  </div>
+
+  <header class="app-header">
+    <h1>Looper <span class="app-version">v8</span></h1>
+    <div class="header-actions">
+      <button id="btnPlayAll" class="btn-icon" aria-label="Play all">▶ Play All</button>
+      <button id="btnStopAll" class="btn-icon" aria-label="Stop all">■ Stop All</button>
+      <button id="btnImport" class="btn-icon" aria-label="Import audio file">⭱ Import</button>
+      <button id="btnFixAudio" class="btn-icon" aria-label="Fix audio routing" title="Rebuild the audio path if sound is stuck on the wrong output">↻ Audio</button>
+      <button id="btnClear" class="btn-icon btn-danger" aria-label="Clear session">Clear</button>
+    </div>
+    <input type="file" id="fileImport" accept="audio/*,.mp3,.m4a,.aac,.wav,.ogg,.flac" multiple hidden />
+  </header>
+
+  <main id="trackList" class="track-list"></main>
+
+  <footer class="transport">
+    <div class="level-meter"><div id="levelMeterFill" class="level-meter-fill"></div></div>
+    <button id="btnRecord" class="btn-record" aria-label="Start recording">
+      <span class="btn-record-dot"></span>
+    </button>
+    <p class="transport-hint">Tap ● to record — other loops keep playing · Tap again to stop &amp; loop it</p>
+  </footer>
+
+  <div id="toast" class="toast"></div>
+
+  <!-- Loops a silent WAV whenever the app is active: playing file-backed
+       media anchors Safari's audio session in the "media playback" category,
+       which is what iOS routes to Bluetooth A2DP. -->
+  <audio id="audioOut" playsinline style="display:none"></audio>
+
+  <template id="trackTemplate">
+    <section class="track-card">
+      <div class="track-header">
+        <input class="track-name" type="text" maxlength="30" />
+        <div class="track-header-buttons">
+          <button class="btn-chip btn-solo" title="Solo">S</button>
+          <button class="btn-chip btn-mute" title="Mute">M</button>
+          <button class="btn-chip btn-download" title="Download WAV">⭳</button>
+          <button class="btn-chip btn-delete" title="Delete">✕</button>
+        </div>
+      </div>
+      <canvas class="track-waveform"></canvas>
+      <p class="track-hint">Drag the yellow handles to trim · drag the middle to slide the loop</p>
+      <div class="track-loop-row">
+        <div class="nudge-group" aria-label="Fine-trim loop start">
+          <span class="nudge-label">Start</span>
+          <button class="nudge" data-edge="start" data-delta="-0.02" aria-label="Start earlier">−</button>
+          <button class="nudge" data-edge="start" data-delta="0.02" aria-label="Start later">+</button>
+        </div>
+        <div class="track-loop-info"></div>
+        <div class="nudge-group" aria-label="Fine-trim loop end">
+          <span class="nudge-label">End</span>
+          <button class="nudge" data-edge="end" data-delta="-0.02" aria-label="End earlier">−</button>
+          <button class="nudge" data-edge="end" data-delta="0.02" aria-label="End later">+</button>
+        </div>
+      </div>
+      <div class="track-timing-row">
+        <div class="nudge-group" aria-label="Shift when this loop plays relative to the others">
+          <span class="nudge-label">Shift</span>
+          <button class="nudge" data-edge="offset" data-delta="-0.1" title="Play 0.1s earlier">◀◀</button>
+          <button class="nudge" data-edge="offset" data-delta="-0.01" title="Play 0.01s earlier">◀</button>
+          <span class="track-offset-info">+0.00s</span>
+          <button class="nudge" data-edge="offset" data-delta="0.01" title="Play 0.01s later">▶</button>
+          <button class="nudge" data-edge="offset" data-delta="0.1" title="Play 0.1s later">▶▶</button>
+        </div>
+        <div class="fade-group" aria-label="Crossfade at the loop seam">
+          <span class="nudge-label">Blend</span>
+          <input class="track-fade" type="range" min="0" max="0.2" step="0.005" />
+          <span class="track-fade-info">15ms</span>
+        </div>
+      </div>
+      <div class="track-footer">
+        <button class="btn-reset-loop">Reset to full length</button>
+        <input class="track-volume" type="range" min="0" max="1.5" step="0.01" value="1" />
+      </div>
+    </section>
+  </template>
+
+  <script src="storage.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
