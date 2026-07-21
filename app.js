@@ -35,7 +35,7 @@ function encodeWav(float32Array, sampleRate) {
 
 // Single source of truth for the app version (semver). Keep CACHE_NAME in
 // sw.js in sync — patch = fixes, minor = features, major = reworks.
-const APP_VERSION = '1.3.0';
+const APP_VERSION = '1.4.0';
 
 // Bold, Jam-Looper-style track colors. Mid-saturated so a full-color card
 // still reads white text; each track's card, lane tiles and waveform take
@@ -62,6 +62,7 @@ class Track {
     this.fade = opts.fade ?? 0.015; // crossfade length at the loop seam (s)
     this.offset = opts.offset ?? 0; // position within the master cycle (s)
     this.repeat = opts.repeat ?? 'fill'; // 'fill' or a count: times to repeat per cycle
+    this.color = opts.color || null; // assigned on first view, then persisted
     this.solo = false;
     this.sourceNode = null;
     // Rendered full-cycle buffer: the trimmed region (with seam crossfade)
@@ -305,6 +306,7 @@ class Track {
       fade: this.fade,
       offset: this.offset,
       repeat: this.repeat,
+      color: this.color,
     };
   }
 }
@@ -835,6 +837,7 @@ class AudioEngine {
 
   stopAll() {
     this.tracks.forEach((t) => t.stop());
+    this.samples.forEach((s) => s.stop());
     this.timelineStart = null;
     this._timelineWall = null;
   }
@@ -1506,7 +1509,7 @@ class LooperApp {
     document.getElementById('padAdd').addEventListener('click', async () => {
       await this.ensureStarted();
       if (this.engine.samples.length >= 16) { this.flashMessage('Pad bank is full'); return; }
-      const s = new Sample(this.engine, { slot: this.engine.samples.length });
+      const s = new Sample(this.engine, { slot: this._nextPadSlot() });
       this.engine.samples.push(s);
       this.renderPadBank();
       const view = this.padViews.get(s.id);
@@ -1521,6 +1524,7 @@ class LooperApp {
 
     window.addEventListener('resize', () => {
       this.trackViews.forEach((v) => { v.editor.resizeAndDraw(); v.lane.resizeAndDraw(); });
+      if (this._sheetSample) this._sheetEditor.resizeAndDraw();
     });
   }
 
@@ -1565,8 +1569,9 @@ class LooperApp {
       if (!e.audioContext) return;
       const sess = 'audioSession' in navigator ? navigator.audioSession.type : 'n/a';
       const rec = e.capturing ? 'REC' : 'idle';
+      const err = this._lastError ? ` · err:${this._lastError}` : '';
       el.textContent =
-        `out:${e.audioContext.state} · ${rec} · session:${sess} · cycle:${e.masterLen().toFixed(2)}s`;
+        `out:${e.audioContext.state} · ${rec} · session:${sess} · cycle:${e.masterLen().toFixed(2)}s${err}`;
     }, 500);
   }
 
@@ -1678,7 +1683,7 @@ class LooperApp {
         let sample = this.engine.samples.find((s) => !s.buffer);
         if (!sample) {
           if (this.engine.samples.length >= 16) { this.flashMessage('Pad bank is full'); break; }
-          sample = new Sample(this.engine, { slot: this.engine.samples.length });
+          sample = new Sample(this.engine, { slot: this._nextPadSlot() });
           this.engine.samples.push(sample);
         }
         sample.name = file.name.replace(/\.[^.]+$/, '').slice(0, 30) || sample.name;
@@ -1705,6 +1710,11 @@ class LooperApp {
   persistSample(sample) {
     if (!sample.buffer) return;
     Storage.saveSample(sample.toStorageRecord()).catch((e) => console.error('sample save failed', e));
+  }
+
+  // Slots must be unique — they're the persisted sort key for the bank.
+  _nextPadSlot() {
+    return this.engine.samples.reduce((m, s) => Math.max(m, s.slot + 1), 0);
   }
 
   renderPadBank() {
@@ -1760,12 +1770,17 @@ class LooperApp {
         this.openSampleSheet(sample);
       }, HOLD_MS);
 
+      let cancelled = false;
       const onMove = (ev) => {
         const dx = ev.clientX - startX;
         const dy = ev.clientY - startY;
-        if (!dragMode && Math.hypot(dx, dy) > DRAG_PX) {
+        if (!dragMode && !cancelled && Math.hypot(dx, dy) > DRAG_PX) {
           clearTimeout(holdTimer);
-          if (!sample.buffer || this.recordingSample) return;
+          if (!sample.buffer || this.recordingSample) {
+            // Not draggable — this movement is a scroll/graze, never a tap.
+            cancelled = true;
+            return;
+          }
           dragMode = true;
           ghost.textContent = `▶ ${sample.name}`;
           ghost.classList.remove('hidden');
@@ -1794,7 +1809,7 @@ class LooperApp {
           }
           return;
         }
-        if (holdFired) return;
+        if (holdFired || cancelled) return;
         // Plain tap.
         if (this.recordingSample === sample || !sample.buffer) {
           this.toggleSampleRecord(sample);
@@ -1826,10 +1841,12 @@ class LooperApp {
     } catch (err) {
       return;
     }
+    const transport = document.getElementById('transport');
     if (this.recordingSample === sample) {
       // Stop this pad's take.
       const buf = await this.engine.stopCapture();
       this.recordingSample = null;
+      transport.classList.remove('rec');
       this._updatePadUI(sample);
       if (!buf || buf.duration < 0.05) {
         this.flashMessage('Recording too short — try again');
@@ -1851,6 +1868,7 @@ class LooperApp {
       return;
     }
     this.recordingSample = sample;
+    transport.classList.add('rec'); // shows the input level meter
     this._updatePadUI(sample);
   }
 
@@ -1892,9 +1910,12 @@ class LooperApp {
     const waveCanvas = document.getElementById('sampleWave');
 
     // One editor for the sheet's lifetime; .track is swapped per sample.
-    this._sheetEditor = new WaveformEditor(waveCanvas, { buffer: null }, (final) => {
-      if (final && this._sheetSample) this.persistSample(this._sheetSample);
-    });
+    // The placeholder needs the fields the editor's cache key reads.
+    this._sheetEditor = new WaveformEditor(
+      waveCanvas,
+      { buffer: null, loopStart: 0, loopEnd: 0, playheadTime: () => null },
+      (final) => { if (final && this._sheetSample) this.persistSample(this._sheetSample); }
+    );
 
     const close = () => {
       sheet.classList.add('hidden');
@@ -1948,10 +1969,10 @@ class LooperApp {
       setTimeout(() => URL.revokeObjectURL(url), 2000);
     });
 
-    document.getElementById('sampleDelete').addEventListener('click', () => {
+    document.getElementById('sampleDelete').addEventListener('click', async () => {
       const s = this._sheetSample;
       if (!s) return;
-      if (!confirm(`Delete sample "${s.name}"?`)) return;
+      if (!(await this.appConfirm(`Delete sample "${s.name}"?`))) return;
       s.stop();
       s.buffer = null;
       s.loopStart = 0;
@@ -1977,6 +1998,26 @@ class LooperApp {
     if (bar) bar.style.width = `${Math.min(100, Math.round(level * 130))}%`;
   }
 
+  // Styled in-app replacement for confirm() — resolves true/false.
+  appConfirm(message, okLabel = 'Delete') {
+    return new Promise((resolve) => {
+      const dlg = document.getElementById('confirmDlg');
+      const ok = document.getElementById('confirmOk');
+      const cancel = document.getElementById('confirmCancel');
+      document.getElementById('confirmMsg').textContent = message;
+      ok.textContent = okLabel;
+      const done = (val) => {
+        dlg.classList.add('hidden');
+        ok.onclick = cancel.onclick = dlg.onclick = null;
+        resolve(val);
+      };
+      ok.onclick = () => done(true);
+      cancel.onclick = () => done(false);
+      dlg.onclick = (ev) => { if (ev.target === dlg) done(false); };
+      dlg.classList.remove('hidden');
+    });
+  }
+
   flashMessage(msg) {
     const toast = document.getElementById('toast');
     toast.textContent = msg;
@@ -1997,7 +2038,7 @@ class LooperApp {
     const node = this.trackTemplate.content.firstElementChild.cloneNode(true);
     this.trackListEl.appendChild(node);
 
-    track.color = TRACK_PALETTE[track.order % TRACK_PALETTE.length];
+    if (!track.color) track.color = TRACK_PALETTE[track.order % TRACK_PALETTE.length];
     node.style.setProperty('--tcolor', track.color);
 
     const nameInput = node.querySelector('.track-name');
@@ -2138,8 +2179,8 @@ class LooperApp {
       soloBtn.classList.toggle('active', track.solo);
     });
 
-    deleteBtn.addEventListener('click', () => {
-      if (!confirm(`Delete "${track.name}"?`)) return;
+    deleteBtn.addEventListener('click', async () => {
+      if (!(await this.appConfirm(`Delete "${track.name}"?`))) return;
       this.engine.removeTrack(track);
       this.trackViews.delete(track.id);
       node.remove();
@@ -2300,6 +2341,7 @@ class LooperApp {
         fade: rec.fade,
         offset: rec.offset,
         repeat: rec.repeat,
+        color: rec.color,
       });
       const floatArr = new Float32Array(rec.channelData);
       const buf = this.engine.audioContext.createBuffer(1, Math.max(1, floatArr.length), rec.sampleRate);
@@ -2351,7 +2393,7 @@ class LooperApp {
 
   async clearSession() {
     if (!this.engine.tracks.length && !this.engine.samples.some((s) => s.buffer)) return;
-    if (!confirm('Delete all tracks and samples? This cannot be undone.')) return;
+    if (!(await this.appConfirm('Delete all tracks and samples? This cannot be undone.', 'Delete all'))) return;
     this.engine.stopAll();
     for (const t of [...this.engine.tracks]) this.engine.removeTrack(t);
     this.trackListEl.innerHTML = '';
@@ -2372,6 +2414,18 @@ class LooperApp {
 window.addEventListener('DOMContentLoaded', () => {
   document.querySelectorAll('.app-version').forEach((el) => { el.textContent = 'v' + APP_VERSION; });
   window.looperApp = new LooperApp();
+
+  // Surface errors instead of dying silently — a short toast for the user,
+  // and the full message parked in the diag line (tap the version badge).
+  const reportError = (msg) => {
+    const app = window.looperApp;
+    if (!app) return;
+    app._lastError = String(msg).slice(0, 200);
+    app.flashMessage('Something went wrong — tap the version badge for details');
+    console.error('[looper]', msg);
+  };
+  window.addEventListener('error', (ev) => reportError(ev.message || ev.error || 'Unknown error'));
+  window.addEventListener('unhandledrejection', (ev) => reportError(ev.reason && (ev.reason.message || ev.reason) || 'Unhandled rejection'));
 
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {

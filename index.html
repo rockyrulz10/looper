@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <title>Looper</title>
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
-  <meta name="theme-color" content="#0f1417" />
+  <meta name="theme-color" content="#0c1114" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="Looper" />
@@ -96,6 +96,17 @@
 
   <!-- Floating chip shown while dragging a pad into the arrangement -->
   <div id="dragGhost" class="drag-ghost hidden"></div>
+
+  <!-- In-app confirm dialog (nicer than the native popup in a PWA) -->
+  <div id="confirmDlg" class="sheet confirm-overlay hidden">
+    <div class="confirm-card">
+      <p id="confirmMsg"></p>
+      <div class="confirm-actions">
+        <button id="confirmCancel" class="btn-pill">Cancel</button>
+        <button id="confirmOk" class="btn-pill btn-pill-danger">Delete</button>
+      </div>
+    </div>
+  </div>
 
   <!-- Loops a silent WAV whenever the app is active: playing file-backed
        media anchors Safari's audio session in the "media playback" category,

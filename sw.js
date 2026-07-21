@@ -1,7 +1,7 @@
 // Bump this to the APP_VERSION in app.js on every release (semver:
 // patch = fixes, minor = features, major = reworks). A changed cache name
 // is what makes the service worker discard the old assets on activate.
-const CACHE_NAME = 'looper-v1.3.0';
+const CACHE_NAME = 'looper-v1.4.0';
 const ASSETS = [
   './',
   './index.html',

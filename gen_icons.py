@@ -1,40 +1,52 @@
+"""Generate the PWA icons in the app's mint/coral branding:
+dark rounded square, mint loop-arrow ring, coral record dot."""
 from PIL import Image, ImageDraw
 import math
 
+BG = (12, 17, 20, 255)        # --bg #0c1114
+MINT = (47, 211, 166, 255)    # --mint
+CORAL = (240, 87, 76, 255)    # --coral
+
+
 def make_icon(size, path):
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    # Draw at 4x for clean anti-aliasing, then downsample.
+    S = size * 4
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
 
-    # Background rounded square
-    bg = (11, 15, 20, 255)
-    radius = size * 0.22
-    d.rounded_rectangle([0, 0, size - 1, size - 1], radius=radius, fill=bg)
+    radius = S * 0.22
+    d.rounded_rectangle([0, 0, S - 1, S - 1], radius=radius, fill=BG)
 
-    cx, cy = size / 2, size / 2
+    cx, cy = S / 2, S / 2
 
-    # Loop arrow ring (two arcs) in accent blue
-    ring_r = size * 0.30
-    ring_w = max(2, int(size * 0.07))
-    accent = (125, 211, 252, 255)
+    # Mint loop ring with an arrowhead (the "loop" glyph).
+    ring_r = S * 0.30
+    ring_w = max(4, int(S * 0.065))
     bbox = [cx - ring_r, cy - ring_r, cx + ring_r, cy + ring_r]
-    d.arc(bbox, start=-40, end=200, fill=accent, width=ring_w)
+    d.arc(bbox, start=-35, end=205, fill=MINT, width=ring_w)
 
-    # Arrowhead at the end of the arc (~200 degrees)
-    ang = math.radians(200)
+    ang = math.radians(205)
     tip_x = cx + ring_r * math.cos(ang)
     tip_y = cy + ring_r * math.sin(ang)
-    ah = size * 0.09
-    perp = ang + math.pi / 2
-    p1 = (tip_x + ah * math.cos(ang + 2.6), tip_y + ah * math.sin(ang + 2.6))
-    p2 = (tip_x + ah * math.cos(ang - 2.6), tip_y + ah * math.sin(ang - 2.6))
-    d.polygon([p1, (tip_x, tip_y), p2], fill=accent)
+    ah = S * 0.085
+    p1 = (tip_x + ah * math.cos(ang + 2.5), tip_y + ah * math.sin(ang + 2.5))
+    p2 = (tip_x + ah * math.cos(ang - 2.5), tip_y + ah * math.sin(ang - 2.5))
+    d.polygon([p1, (tip_x, tip_y), p2], fill=MINT)
 
-    # Center record dot in red
-    dot_r = size * 0.14
-    d.ellipse([cx - dot_r, cy - dot_r, cx + dot_r, cy + dot_r], fill=(239, 68, 68, 255))
+    # Coral record dot with a soft highlight.
+    dot_r = S * 0.135
+    d.ellipse([cx - dot_r, cy - dot_r, cx + dot_r, cy + dot_r], fill=CORAL)
+    hl_r = dot_r * 0.45
+    d.ellipse(
+        [cx - dot_r * 0.35 - hl_r, cy - dot_r * 0.4 - hl_r,
+         cx - dot_r * 0.35 + hl_r, cy - dot_r * 0.4 + hl_r],
+        fill=(255, 158, 150, 160),
+    )
 
+    img = img.resize((size, size), Image.LANCZOS)
     img.save(path)
+
 
 make_icon(192, "icons/icon-192.png")
 make_icon(512, "icons/icon-512.png")
-print("done")
+print("icons regenerated")
