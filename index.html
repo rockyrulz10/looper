@@ -17,7 +17,7 @@
   <div id="splash">
     <div class="splash-inner">
       <div class="splash-logo">◉</div>
-      <h1>Looper <span class="app-version">v1.1.0</span></h1>
+      <h1>Looper <span class="app-version">v1.2.0</span></h1>
       <p>Record. Layer. Loop.</p>
       <button id="btnEnable" class="btn-primary">Start</button>
       <p class="splash-hint">Microphone access is requested on your first recording.</p>
@@ -26,7 +26,7 @@
   </div>
 
   <header class="app-header">
-    <h1>Looper <span class="app-version" id="versionBadge">v1.1.0</span></h1>
+    <h1>Looper <span class="app-version" id="versionBadge">v1.2.0</span></h1>
     <div class="header-actions">
       <button id="btnPlayStop" class="btn-icon btn-playstop" aria-label="Play or stop all loops">▶</button>
       <button id="btnMenu" class="btn-icon" aria-label="Menu">⋯</button>
@@ -78,22 +78,16 @@
         <button class="btn-chip btn-solo" title="Solo">S</button>
         <button class="btn-chip btn-expand" title="Edit loop" aria-label="Edit loop">▾</button>
       </div>
-      <canvas class="track-lane" title="Drag to move this loop in the cycle"></canvas>
+      <canvas class="track-waveform" title="Drag the edges to trim the loop"></canvas>
+      <canvas class="track-lane" title="Drag to move · drag the right edge to set repeats"></canvas>
       <div class="track-details">
-        <div class="detail-head">Trim loop <span class="track-loop-info"></span></div>
-        <canvas class="track-waveform"></canvas>
         <div class="track-loop-row">
           <div class="nudge-group" aria-label="Fine-trim loop start">
             <span class="nudge-label">Start</span>
             <button class="nudge" data-edge="start" data-delta="-0.01" aria-label="Start earlier">−</button>
             <button class="nudge" data-edge="start" data-delta="0.01" aria-label="Start later">+</button>
           </div>
-          <div class="nudge-group" aria-label="Fine-move this loop in the cycle">
-            <span class="nudge-label">Place</span>
-            <button class="nudge" data-edge="offset" data-delta="-0.01" title="0.01s earlier">◀</button>
-            <span class="track-offset-info">@0.00s</span>
-            <button class="nudge" data-edge="offset" data-delta="0.01" title="0.01s later">▶</button>
-          </div>
+          <span class="track-loop-info"></span>
           <div class="nudge-group" aria-label="Fine-trim loop end">
             <span class="nudge-label">End</span>
             <button class="nudge" data-edge="end" data-delta="-0.01" aria-label="End earlier">−</button>
@@ -101,10 +95,16 @@
           </div>
         </div>
         <div class="track-timing-row">
+          <div class="nudge-group" aria-label="Fine-move this loop in the cycle">
+            <span class="nudge-label">Place</span>
+            <button class="nudge" data-edge="offset" data-delta="-0.01" title="0.01s earlier">◀</button>
+            <span class="track-offset-info">@0.00s</span>
+            <button class="nudge" data-edge="offset" data-delta="0.01" title="0.01s later">▶</button>
+          </div>
           <div class="nudge-group" aria-label="How many times this loop plays per cycle">
-            <span class="nudge-label">Repeat</span>
+            <span class="nudge-label">Loops</span>
             <select class="track-repeat">
-              <option value="fill">Fill cycle</option>
+              <option value="fill">Fill</option>
               <option value="1">×1</option>
               <option value="2">×2</option>
               <option value="3">×3</option>
@@ -113,18 +113,21 @@
               <option value="8">×8</option>
             </select>
           </div>
+        </div>
+        <div class="track-timing-row">
           <div class="fade-group" aria-label="Crossfade at the loop seam">
             <span class="nudge-label">Blend</span>
             <input class="track-fade" type="range" min="0" max="0.2" step="0.005" />
             <span class="track-fade-info">15ms</span>
           </div>
-        </div>
-        <div class="track-footer">
-          <button class="btn-reset-loop">Reset</button>
-          <div class="vol-group">
+          <div class="vol-group" aria-label="Track volume">
             <span class="nudge-label">Vol</span>
             <input class="track-volume" type="range" min="0" max="1.5" step="0.01" value="1" />
           </div>
+        </div>
+        <div class="track-footer">
+          <button class="btn-reset-loop">Reset</button>
+          <span class="footer-spacer"></span>
           <button class="btn-chip btn-download" title="Download WAV">⭳</button>
           <button class="btn-chip btn-delete" title="Delete track">✕</button>
         </div>

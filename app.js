@@ -35,7 +35,7 @@ function encodeWav(float32Array, sampleRate) {
 
 // Single source of truth for the app version (semver). Keep CACHE_NAME in
 // sw.js in sync — patch = fixes, minor = features, major = reworks.
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.2.0';
 
 // Bold, Jam-Looper-style track colors. Mid-saturated so a full-color card
 // still reads white text; each track's card, lane tiles and waveform take
@@ -788,7 +788,7 @@ class WaveformEditor {
     } else {
       return;
     }
-    this.canvas.setPointerCapture(e.pointerId);
+    try { this.canvas.setPointerCapture(e.pointerId); } catch (_) { /* noop */ }
     e.preventDefault();
   }
 
@@ -937,11 +937,13 @@ class WaveformEditor {
 }
 
 // ---------------------------------------------------------------------------
-// TimelineLane — GarageBand-style arrange strip. Shows the track's loop as
-// draggable block(s) placed within the shared master cycle; drag left/right
-// to line the loop up against the other tracks. Snaps to their edges and to
-// cycle quarter marks. All lanes share the same time scale (the master
-// cycle), so they stack in vertical alignment and one playhead sweeps them.
+// TimelineLane — the arrange strip. Shows the full master cycle with a time
+// ruler and empty space. The loop is a colored block placed at `offset`:
+//   • drag the block body    → move it in the cycle (offset)
+//   • drag the block's right edge → set how many times it loops (repeat),
+//     dragging to the far end = fill the cycle
+// All lanes share the master-cycle time scale, so they stack in alignment
+// and one playhead sweeps them. Snaps to other tracks' edges + quarter marks.
 // ---------------------------------------------------------------------------
 class TimelineLane {
   constructor(canvas, track, app, onChange) {
@@ -951,10 +953,13 @@ class TimelineLane {
     this.onChange = onChange;
     this.ctx = canvas.getContext('2d');
     this.dragging = false;
+    this.mode = null;      // 'move' | 'loop'
     this.moved = false;
     this.dragStartX = 0;
     this.dragOrigOffset = 0;
+    this.dragL = 0;
     this.snaps = [];
+    this._snapAt = null;   // cycle-time of an active snap (for the guide line)
 
     canvas.addEventListener('pointerdown', (e) => this.onDown(e));
     canvas.addEventListener('pointermove', (e) => this.onMove(e));
@@ -975,7 +980,8 @@ class TimelineLane {
     this.draw();
   }
 
-  timeToX(t) { return (t / this.cycleLen()) * this.canvas.width; }
+  timeToX(t) { return (t / (this.dragL || this.cycleLen())) * this.canvas.width; }
+  xToTime(x) { return (x / this.canvas.width) * (this.dragL || this.cycleLen()); }
 
   getX(e) {
     const rect = this.canvas.getBoundingClientRect();
@@ -983,23 +989,22 @@ class TimelineLane {
     return (e.clientX - rect.left) * dpr;
   }
 
-  // Tile start times (seconds) — mirrors the audio placement in _rebuildProc.
-  _tiles(L) {
+  // Geometry shared by drawing + hit-testing.
+  _layout(L) {
     const region = this.track.loopEnd - this.track.loopStart;
-    if (region <= 0) return { region: 0, starts: [] };
+    if (region <= 0) return { region: 0, reps: 0, maxReps: 0, off: 0, extentEnd: 0 };
     const maxReps = Math.max(1, Math.ceil(L / region - 1e-9));
     const reps = this.track.repeat === 'fill'
       ? maxReps
       : Math.min(Math.max(1, parseInt(this.track.repeat, 10) || 1), maxReps);
     const off = ((this.track.offset % L) + L) % L;
-    const starts = [];
-    for (let k = 0; k < reps; k++) starts.push((off + k * region) % L);
-    return { region, starts };
+    const extentEnd = Math.min(off + reps * region, L);
+    return { region, reps, maxReps, off, extentEnd };
   }
 
   _ensureCache() {
     const t = this.track;
-    const L = this.cycleLen();
+    const L = this.dragL || this.cycleLen();
     const key = [this.canvas.width, this.canvas.height, L.toFixed(3),
       t.loopStart.toFixed(3), t.loopEnd.toFixed(3), t.offset.toFixed(3),
       t.repeat, t.color].join('|');
@@ -1026,46 +1031,56 @@ class TimelineLane {
     const t = this.track;
     const w = this._cache.width, h = this._cache.height;
     const dpr = window.devicePixelRatio || 1;
+    const rulerH = 14 * dpr;
+    const bodyY = rulerH, bodyH = h - rulerH;
     ctx.clearRect(0, 0, w, h);
-    ctx.fillStyle = 'rgba(255,255,255,0.03)';
-    ctx.fillRect(0, 0, w, h);
 
-    // faint second/grid lines for a sense of scale
-    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
-    ctx.lineWidth = 1;
-    const gridStep = L > 8 ? 2 : 1;
-    for (let s = gridStep; s < L - 1e-6; s += gridStep) {
+    // Empty timeline background (this is the visible "empty space").
+    ctx.fillStyle = 'rgba(255,255,255,0.02)';
+    ctx.fillRect(0, bodyY, w, bodyH);
+
+    // Ruler ticks + numbers.
+    const gridStep = L > 12 ? 4 : (L > 6 ? 2 : 1);
+    ctx.textBaseline = 'top';
+    ctx.font = `${8.5 * dpr}px -apple-system, system-ui, sans-serif`;
+    for (let s = 0; s < L - 1e-6; s += gridStep) {
       const x = this.timeToX(s);
-      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+      ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x, bodyY); ctx.lineTo(x, h); ctx.stroke();
+      if (s > 0) {
+        ctx.fillStyle = 'rgba(255,255,255,0.34)';
+        ctx.fillText(String(s), x + 2 * dpr, 2 * dpr);
+      }
     }
 
     if (!t.buffer) return;
-    const { region, starts } = this._tiles(L);
+    const { region, reps, off, extentEnd } = this._layout(L);
     if (region <= 0) return;
     const accent = t.color || '#6ee7ff';
     const data = t.buffer.getChannelData(0);
     const sr = t.buffer.sampleRate;
     const regS = Math.floor(t.loopStart * sr);
     const regE = Math.min(Math.floor(t.loopEnd * sr), data.length);
-    const mid = h / 2;
+    const mid = bodyY + bodyH / 2;
 
-    // Draw one tile piece spanning cycle time [ca,cb], showing region
-    // fraction [fa,fb] of the loop as a mini waveform.
-    const drawPiece = (ca, cb, fa, fb) => {
+    const drawPiece = (ca, cb, fa, fb, first, last) => {
       const x0 = this.timeToX(ca), x1 = this.timeToX(cb);
       const pw = Math.max(1, x1 - x0);
-      ctx.globalAlpha = 0.16;
-      ctx.fillStyle = accent;
-      this._roundRect(ctx, x0 + 1, 3, pw - 2, h - 6, 5 * dpr); ctx.fill();
-      ctx.globalAlpha = 0.65;
+      const grad = ctx.createLinearGradient(0, bodyY, 0, h);
+      grad.addColorStop(0, this._tint(accent, 0.42));
+      grad.addColorStop(1, this._tint(accent, 0.24));
+      ctx.fillStyle = grad;
+      this._roundRect(ctx, x0 + 1, bodyY + 3, pw - 2, bodyH - 6, 6 * dpr); ctx.fill();
       ctx.lineWidth = 1.5;
-      ctx.strokeStyle = accent;
-      this._roundRect(ctx, x0 + 1, 3, pw - 2, h - 6, 5 * dpr); ctx.stroke();
+      ctx.strokeStyle = this._tint(accent, 0.9);
+      this._roundRect(ctx, x0 + 1, bodyY + 3, pw - 2, bodyH - 6, 6 * dpr); ctx.stroke();
 
       const s0 = Math.floor(regS + fa * (regE - regS));
       const s1 = Math.floor(regS + fb * (regE - regS));
       const total = Math.max(1, s1 - s0);
       const step = Math.max(1, Math.floor(total / pw));
+      ctx.strokeStyle = 'rgba(255,255,255,0.85)';
       ctx.globalAlpha = 0.9;
       ctx.beginPath();
       for (let px = 0; px < pw; px++) {
@@ -1077,48 +1092,100 @@ class TimelineLane {
         }
         if (mn > mx) { mn = 0; mx = 0; }
         const xx = x0 + px + 0.5;
-        ctx.moveTo(xx, mid + mn * mid * 0.6);
-        ctx.lineTo(xx, mid + mx * mid * 0.6);
+        ctx.moveTo(xx, mid + mn * (bodyH / 2) * 0.62);
+        ctx.lineTo(xx, mid + mx * (bodyH / 2) * 0.62);
       }
       ctx.stroke();
       ctx.globalAlpha = 1;
     };
 
-    for (const ts of starts) {
+    // Tiles for each repeat (wrap-aware).
+    for (let k = 0; k < reps; k++) {
+      const ts = (off + k * region) % L;
       if (ts + region <= L + 1e-6) {
         drawPiece(ts, Math.min(ts + region, L), 0, 1);
       } else {
-        const f = (L - ts) / region; // split across the cycle wrap
+        const f = (L - ts) / region;
         drawPiece(ts, L, 0, f);
         drawPiece(0, ts + region - L, f, 1);
       }
     }
+
+    // Right-edge loop handle (drag to add/remove repeats).
+    const hx = this.timeToX(extentEnd);
+    ctx.fillStyle = '#fff';
+    this._roundRect(ctx, hx - 4 * dpr, bodyY + 6, 8 * dpr, bodyH - 12, 3 * dpr);
+    ctx.fill();
+    ctx.strokeStyle = this._tint(accent, 0.5);
+    ctx.lineWidth = 1;
+    for (let g = -1; g <= 1; g++) {
+      const gy = mid + g * 4 * dpr;
+      ctx.beginPath();
+      ctx.moveTo(hx - 1.5 * dpr, gy); ctx.lineTo(hx + 1.5 * dpr, gy); ctx.stroke();
+    }
+  }
+
+  // Lighten a hex color toward white by amount (0..1) → rgba string.
+  _tint(hex, a) {
+    const n = parseInt(hex.slice(1), 16);
+    const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+    return `rgba(${r},${g},${b},${a})`;
   }
 
   draw() {
     this._ensureCache();
     const { ctx, canvas } = this;
+    const dpr = window.devicePixelRatio || 1;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(this._cache, 0, 0);
 
+    // Snap guide while dragging.
+    if (this.dragging && this._snapAt != null) {
+      const x = this.timeToX(this._snapAt);
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.fillRect(x - 0.5, 0, 1, canvas.height);
+    }
+
+    // Shared cycle playhead + top triangle.
     const e = this.app.engine;
     if (e.timelineStart != null && e.audioContext && e.anyPlaying()) {
-      const L = this.cycleLen();
+      const L = this.dragL || this.cycleLen();
       const pos = (((e.audioContext.currentTime - e.timelineStart) % L) + L) % L;
       const x = this.timeToX(pos);
-      ctx.fillStyle = 'rgba(248,250,252,0.9)';
+      ctx.fillStyle = 'rgba(248,250,252,0.92)';
       ctx.fillRect(x - 1, 0, 2, canvas.height);
+      ctx.beginPath();
+      ctx.moveTo(x - 4 * dpr, 0); ctx.lineTo(x + 4 * dpr, 0); ctx.lineTo(x, 5 * dpr);
+      ctx.closePath(); ctx.fill();
     }
   }
 
   onDown(e) {
     if (!this.track.buffer) return;
+    const L = this.cycleLen();
+    this.dragL = L;
+    const x = this.getX(e);
+    const dpr = window.devicePixelRatio || 1;
+    const lay = this._layout(L);
+    const handleX = this.timeToX(lay.extentEnd);
+
+    if (Math.abs(x - handleX) <= 16 * dpr) {
+      this.mode = 'loop';
+    } else {
+      // body hit-test (wrap-aware)
+      const xc = this.xToTime(x);
+      const rel = (((xc - lay.off) % L) + L) % L;
+      if (rel < lay.reps * lay.region) this.mode = 'move';
+      else { this.dragL = 0; return; } // tapped empty space
+    }
+
     this.dragging = true;
     this.moved = false;
-    this.dragStartX = this.getX(e);
+    this.dragStartX = x;
     this.dragOrigOffset = this.track.offset;
-    // Snap targets: every other track's tile edges, plus cycle quarter marks.
-    const L = this.cycleLen();
+    this._snapAt = null;
+
+    // Snap targets for move: other tracks' tile edges + cycle quarter marks.
     this.snaps = [0];
     for (const t of this.app.engine.tracks) {
       if (t === this.track || !t.buffer) continue;
@@ -1140,17 +1207,29 @@ class TimelineLane {
     if (!this.dragging || !this.track.buffer) return;
     const x = this.getX(e);
     if (Math.abs(x - this.dragStartX) > 2) this.moved = true;
-    const L = this.cycleLen();
-    let off = this.dragOrigOffset + (x - this.dragStartX) / this.canvas.width * L;
-    off = ((off % L) + L) % L;
-    const thr = (12 * (window.devicePixelRatio || 1)) / this.canvas.width * L;
-    let best = null, bd = thr;
-    for (const c of this.snaps) {
-      let d = Math.abs(off - c); d = Math.min(d, L - d); // wrap-aware distance
-      if (d < bd) { bd = d; best = c; }
+    const L = this.dragL;
+    this._snapAt = null;
+
+    if (this.mode === 'move') {
+      let off = this.dragOrigOffset + (x - this.dragStartX) / this.canvas.width * L;
+      off = ((off % L) + L) % L;
+      const thr = (12 * (window.devicePixelRatio || 1)) / this.canvas.width * L;
+      let best = null, bd = thr;
+      for (const c of this.snaps) {
+        let d = Math.abs(off - c); d = Math.min(d, L - d);
+        if (d < bd) { bd = d; best = c; }
+      }
+      if (best != null) { off = best; this._snapAt = best; }
+      this.track.setOffset(off);
+    } else if (this.mode === 'loop') {
+      const lay = this._layout(L);
+      const xc = Math.max(0, this.xToTime(x));
+      let rel = xc - lay.off;
+      if (rel < 0) rel += L;
+      let reps = Math.max(1, Math.round(rel / lay.region));
+      reps = Math.min(reps, lay.maxReps);
+      this.track.setRepeat(reps >= lay.maxReps ? 'fill' : reps);
     }
-    if (best != null) off = best;
-    this.track.setOffset(off);
     this.draw();
     if (this.onChange) this.onChange(false);
   }
@@ -1158,8 +1237,11 @@ class TimelineLane {
   onUp(e) {
     if (!this.dragging) return;
     this.dragging = false;
+    this.dragL = 0;
+    this._snapAt = null;
     try { this.canvas.releasePointerCapture(e.pointerId); } catch (_) { /* noop */ }
     if (this.track.sourceNode) this.track.playSynced();
+    this.draw();
     if (this.onChange) this.onChange(true);
   }
 }
@@ -1192,10 +1274,7 @@ class LooperApp {
       const e = this.engine;
       const playing = e.tracks.some((t) => t.sourceNode);
       if (playing || wasPlaying) {
-        this.trackViews.forEach((v) => {
-          v.lane.draw();
-          if (v.root.classList.contains('open')) v.editor.draw();
-        });
+        this.trackViews.forEach((v) => { v.lane.draw(); v.editor.draw(); });
         this.updatePlayStopButton();
       }
       let p = 0;
@@ -1475,17 +1554,20 @@ class LooperApp {
     };
     updateFadeInfo();
 
+    // Trim: drag the waveform edges. Live-updates the arrange lane block.
     const editor = new WaveformEditor(canvas, track, (final) => {
       updateInfo();
+      lane.draw();
       if (final) {
         this.cycleChanged(); // trimming can change the master cycle length
         this.persistTrack(track);
       }
     });
 
-    // GarageBand-style drag placement: dragging the block sets track.offset.
+    // Arrange: drag the block to move it; drag its right edge to set repeats.
     const lane = new TimelineLane(laneCanvas, track, this, (final) => {
       updateOffsetInfo();
+      repeatSel.value = String(track.repeat);
       if (final) {
         refreshTiming();
         this.persistTrack(track);
@@ -1499,18 +1581,13 @@ class LooperApp {
     updateInfo();
     this.updateEmptyState();
 
-    // One-time hint once layering starts and placement becomes meaningful.
-    if (this.trackViews.size === 2 && !this._laneHintShown) {
+    // One-time hint the first time a loop exists.
+    if (this.trackViews.size === 1 && !this._laneHintShown) {
       this._laneHintShown = true;
-      this.flashMessage('Tip: drag a loop’s bar to line it up in the cycle');
+      this.flashMessage('Drag the waveform edges to trim · drag the bar to move & loop');
     }
 
-    expandBtn.addEventListener('click', () => {
-      const opening = !node.classList.contains('open');
-      node.classList.toggle('open');
-      // The trim waveform lives in the collapsible panel; size it when shown.
-      if (opening) requestAnimationFrame(() => editor.resizeAndDraw());
-    });
+    expandBtn.addEventListener('click', () => node.classList.toggle('open'));
 
     nameInput.addEventListener('change', () => {
       track.name = nameInput.value || track.name;
