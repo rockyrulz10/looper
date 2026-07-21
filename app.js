@@ -33,6 +33,10 @@ function encodeWav(float32Array, sampleRate) {
   return new Blob([view], { type: 'audio/wav' });
 }
 
+// Single source of truth for the app version (semver). Keep CACHE_NAME in
+// sw.js in sync — patch = fixes, minor = features, major = reworks.
+const APP_VERSION = '1.0.0';
+
 // Accent colors cycled across tracks (dot, waveform tint, sliders).
 const TRACK_PALETTE = ['#6ee7ff', '#f0abfc', '#86efac', '#fcd34d', '#fda4af', '#a5b4fc', '#5eead4', '#fdba74'];
 
@@ -931,6 +935,234 @@ class WaveformEditor {
 }
 
 // ---------------------------------------------------------------------------
+// TimelineLane — GarageBand-style arrange strip. Shows the track's loop as
+// draggable block(s) placed within the shared master cycle; drag left/right
+// to line the loop up against the other tracks. Snaps to their edges and to
+// cycle quarter marks. All lanes share the same time scale (the master
+// cycle), so they stack in vertical alignment and one playhead sweeps them.
+// ---------------------------------------------------------------------------
+class TimelineLane {
+  constructor(canvas, track, app, onChange) {
+    this.canvas = canvas;
+    this.track = track;
+    this.app = app;
+    this.onChange = onChange;
+    this.ctx = canvas.getContext('2d');
+    this.dragging = false;
+    this.moved = false;
+    this.dragStartX = 0;
+    this.dragOrigOffset = 0;
+    this.snaps = [];
+
+    canvas.addEventListener('pointerdown', (e) => this.onDown(e));
+    canvas.addEventListener('pointermove', (e) => this.onMove(e));
+    canvas.addEventListener('pointerup', (e) => this.onUp(e));
+    canvas.addEventListener('pointercancel', (e) => this.onUp(e));
+  }
+
+  cycleLen() {
+    return Math.max(this.app.engine.masterLen(), this.track.loopEnd - this.track.loopStart, 0.01);
+  }
+
+  resizeAndDraw() {
+    const rect = this.canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    this.canvas.width = Math.max(1, Math.round(rect.width * dpr));
+    this.canvas.height = Math.max(1, Math.round(rect.height * dpr));
+    this._cacheKey = null;
+    this.draw();
+  }
+
+  timeToX(t) { return (t / this.cycleLen()) * this.canvas.width; }
+
+  getX(e) {
+    const rect = this.canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    return (e.clientX - rect.left) * dpr;
+  }
+
+  // Tile start times (seconds) — mirrors the audio placement in _rebuildProc.
+  _tiles(L) {
+    const region = this.track.loopEnd - this.track.loopStart;
+    if (region <= 0) return { region: 0, starts: [] };
+    const maxReps = Math.max(1, Math.ceil(L / region - 1e-9));
+    const reps = this.track.repeat === 'fill'
+      ? maxReps
+      : Math.min(Math.max(1, parseInt(this.track.repeat, 10) || 1), maxReps);
+    const off = ((this.track.offset % L) + L) % L;
+    const starts = [];
+    for (let k = 0; k < reps; k++) starts.push((off + k * region) % L);
+    return { region, starts };
+  }
+
+  _ensureCache() {
+    const t = this.track;
+    const L = this.cycleLen();
+    const key = [this.canvas.width, this.canvas.height, L.toFixed(3),
+      t.loopStart.toFixed(3), t.loopEnd.toFixed(3), t.offset.toFixed(3),
+      t.repeat, t.color].join('|');
+    if (this._cacheKey === key && this._cache) return;
+    this._cacheKey = key;
+    if (!this._cache) this._cache = document.createElement('canvas');
+    this._cache.width = this.canvas.width;
+    this._cache.height = this.canvas.height;
+    this._renderStatic(this._cache.getContext('2d'), L);
+  }
+
+  _roundRect(ctx, x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  _renderStatic(ctx, L) {
+    const t = this.track;
+    const w = this._cache.width, h = this._cache.height;
+    const dpr = window.devicePixelRatio || 1;
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = 'rgba(255,255,255,0.03)';
+    ctx.fillRect(0, 0, w, h);
+
+    // faint second/grid lines for a sense of scale
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+    ctx.lineWidth = 1;
+    const gridStep = L > 8 ? 2 : 1;
+    for (let s = gridStep; s < L - 1e-6; s += gridStep) {
+      const x = this.timeToX(s);
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+    }
+
+    if (!t.buffer) return;
+    const { region, starts } = this._tiles(L);
+    if (region <= 0) return;
+    const accent = t.color || '#6ee7ff';
+    const data = t.buffer.getChannelData(0);
+    const sr = t.buffer.sampleRate;
+    const regS = Math.floor(t.loopStart * sr);
+    const regE = Math.min(Math.floor(t.loopEnd * sr), data.length);
+    const mid = h / 2;
+
+    // Draw one tile piece spanning cycle time [ca,cb], showing region
+    // fraction [fa,fb] of the loop as a mini waveform.
+    const drawPiece = (ca, cb, fa, fb) => {
+      const x0 = this.timeToX(ca), x1 = this.timeToX(cb);
+      const pw = Math.max(1, x1 - x0);
+      ctx.globalAlpha = 0.16;
+      ctx.fillStyle = accent;
+      this._roundRect(ctx, x0 + 1, 3, pw - 2, h - 6, 5 * dpr); ctx.fill();
+      ctx.globalAlpha = 0.65;
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = accent;
+      this._roundRect(ctx, x0 + 1, 3, pw - 2, h - 6, 5 * dpr); ctx.stroke();
+
+      const s0 = Math.floor(regS + fa * (regE - regS));
+      const s1 = Math.floor(regS + fb * (regE - regS));
+      const total = Math.max(1, s1 - s0);
+      const step = Math.max(1, Math.floor(total / pw));
+      ctx.globalAlpha = 0.9;
+      ctx.beginPath();
+      for (let px = 0; px < pw; px++) {
+        let mn = 1, mx = -1;
+        const i0 = s0 + px * step;
+        for (let i = 0; i < step; i++) {
+          const idx = i0 + i; if (idx >= s1) break;
+          const v = data[idx]; if (v < mn) mn = v; if (v > mx) mx = v;
+        }
+        if (mn > mx) { mn = 0; mx = 0; }
+        const xx = x0 + px + 0.5;
+        ctx.moveTo(xx, mid + mn * mid * 0.6);
+        ctx.lineTo(xx, mid + mx * mid * 0.6);
+      }
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    };
+
+    for (const ts of starts) {
+      if (ts + region <= L + 1e-6) {
+        drawPiece(ts, Math.min(ts + region, L), 0, 1);
+      } else {
+        const f = (L - ts) / region; // split across the cycle wrap
+        drawPiece(ts, L, 0, f);
+        drawPiece(0, ts + region - L, f, 1);
+      }
+    }
+  }
+
+  draw() {
+    this._ensureCache();
+    const { ctx, canvas } = this;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(this._cache, 0, 0);
+
+    const e = this.app.engine;
+    if (e.timelineStart != null && e.audioContext && e.anyPlaying()) {
+      const L = this.cycleLen();
+      const pos = (((e.audioContext.currentTime - e.timelineStart) % L) + L) % L;
+      const x = this.timeToX(pos);
+      ctx.fillStyle = 'rgba(248,250,252,0.9)';
+      ctx.fillRect(x - 1, 0, 2, canvas.height);
+    }
+  }
+
+  onDown(e) {
+    if (!this.track.buffer) return;
+    this.dragging = true;
+    this.moved = false;
+    this.dragStartX = this.getX(e);
+    this.dragOrigOffset = this.track.offset;
+    // Snap targets: every other track's tile edges, plus cycle quarter marks.
+    const L = this.cycleLen();
+    this.snaps = [0];
+    for (const t of this.app.engine.tracks) {
+      if (t === this.track || !t.buffer) continue;
+      const region = t.loopEnd - t.loopStart;
+      if (region <= 0) continue;
+      const maxReps = Math.max(1, Math.ceil(L / region - 1e-9));
+      const reps = t.repeat === 'fill'
+        ? maxReps
+        : Math.min(Math.max(1, parseInt(t.repeat, 10) || 1), maxReps);
+      const off = ((t.offset % L) + L) % L;
+      for (let k = 0; k < reps; k++) this.snaps.push((off + k * region) % L);
+    }
+    for (const f of [0.25, 0.5, 0.75]) this.snaps.push(f * L);
+    try { this.canvas.setPointerCapture(e.pointerId); } catch (_) { /* noop */ }
+    e.preventDefault();
+  }
+
+  onMove(e) {
+    if (!this.dragging || !this.track.buffer) return;
+    const x = this.getX(e);
+    if (Math.abs(x - this.dragStartX) > 2) this.moved = true;
+    const L = this.cycleLen();
+    let off = this.dragOrigOffset + (x - this.dragStartX) / this.canvas.width * L;
+    off = ((off % L) + L) % L;
+    const thr = (12 * (window.devicePixelRatio || 1)) / this.canvas.width * L;
+    let best = null, bd = thr;
+    for (const c of this.snaps) {
+      let d = Math.abs(off - c); d = Math.min(d, L - d); // wrap-aware distance
+      if (d < bd) { bd = d; best = c; }
+    }
+    if (best != null) off = best;
+    this.track.setOffset(off);
+    this.draw();
+    if (this.onChange) this.onChange(false);
+  }
+
+  onUp(e) {
+    if (!this.dragging) return;
+    this.dragging = false;
+    try { this.canvas.releasePointerCapture(e.pointerId); } catch (_) { /* noop */ }
+    if (this.track.sourceNode) this.track.playSynced();
+    if (this.onChange) this.onChange(true);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // LooperApp — wires the engine + storage to the DOM.
 // ---------------------------------------------------------------------------
 class LooperApp {
@@ -958,7 +1190,10 @@ class LooperApp {
       const e = this.engine;
       const playing = e.tracks.some((t) => t.sourceNode);
       if (playing || wasPlaying) {
-        this.trackViews.forEach((v) => v.editor.draw());
+        this.trackViews.forEach((v) => {
+          v.lane.draw();
+          if (v.root.classList.contains('open')) v.editor.draw();
+        });
         this.updatePlayStopButton();
       }
       let p = 0;
@@ -1027,7 +1262,7 @@ class LooperApp {
     });
 
     window.addEventListener('resize', () => {
-      this.trackViews.forEach((v) => v.editor.resizeAndDraw());
+      this.trackViews.forEach((v) => { v.editor.resizeAndDraw(); v.lane.resizeAndDraw(); });
     });
   }
 
@@ -1203,13 +1438,13 @@ class LooperApp {
     const downloadBtn = node.querySelector('.btn-download');
     const volumeSlider = node.querySelector('.track-volume');
     const canvas = node.querySelector('.track-waveform');
+    const laneCanvas = node.querySelector('.track-lane');
     const infoEl = node.querySelector('.track-loop-info');
     const nudges = node.querySelectorAll('.nudge');
     const resetBtn = node.querySelector('.btn-reset-loop');
     const offsetInfo = node.querySelector('.track-offset-info');
     const fadeSlider = node.querySelector('.track-fade');
     const fadeInfo = node.querySelector('.track-fade-info');
-    const posSlider = node.querySelector('.track-pos');
     const repeatSel = node.querySelector('.track-repeat');
 
     nameInput.value = track.name;
@@ -1228,18 +1463,14 @@ class LooperApp {
     const updateFadeInfo = () => {
       fadeInfo.textContent = `${Math.round(track.fade * 1000)}ms`;
     };
-    // Keep the Place slider spanning the current master cycle length.
     const refreshTiming = () => {
-      const L = Math.max(this.engine.masterLen(), 0.01);
-      posSlider.max = L.toFixed(2);
-      if (!this._draggingPos) posSlider.value = Math.min(track.offset, L);
       updateOffsetInfo();
+      if (lane) lane.draw();
     };
     // Re-render + re-join a playing track after its placement/blend changed.
     const resync = () => {
       if (track.sourceNode) track.playSynced();
     };
-    refreshTiming();
     updateFadeInfo();
 
     const editor = new WaveformEditor(canvas, track, (final) => {
@@ -1250,13 +1481,34 @@ class LooperApp {
       }
     });
 
-    this.trackViews.set(track.id, { root: node, editor, refreshTiming });
+    // GarageBand-style drag placement: dragging the block sets track.offset.
+    const lane = new TimelineLane(laneCanvas, track, this, (final) => {
+      updateOffsetInfo();
+      if (final) {
+        refreshTiming();
+        this.persistTrack(track);
+      }
+    });
 
-    requestAnimationFrame(() => editor.resizeAndDraw());
+    this.trackViews.set(track.id, { root: node, editor, lane, refreshTiming });
+
+    refreshTiming();
+    requestAnimationFrame(() => { editor.resizeAndDraw(); lane.resizeAndDraw(); });
     updateInfo();
     this.updateEmptyState();
 
-    expandBtn.addEventListener('click', () => node.classList.toggle('open'));
+    // One-time hint once layering starts and placement becomes meaningful.
+    if (this.trackViews.size === 2 && !this._laneHintShown) {
+      this._laneHintShown = true;
+      this.flashMessage('Tip: drag a loop’s bar to line it up in the cycle');
+    }
+
+    expandBtn.addEventListener('click', () => {
+      const opening = !node.classList.contains('open');
+      node.classList.toggle('open');
+      // The trim waveform lives in the collapsible panel; size it when shown.
+      if (opening) requestAnimationFrame(() => editor.resizeAndDraw());
+    });
 
     nameInput.addEventListener('change', () => {
       track.name = nameInput.value || track.name;
@@ -1297,7 +1549,8 @@ class LooperApp {
       this.bindHold(btn, () => {
         if (edge === 'offset') {
           track.setOffset(track.offset + delta);
-          refreshTiming();
+          updateOffsetInfo();
+          lane.draw();
         } else if (edge === 'start') {
           track.setLoopPoints(track.loopStart + delta, track.loopEnd);
         } else {
@@ -1310,20 +1563,9 @@ class LooperApp {
       });
     });
 
-    posSlider.addEventListener('input', () => {
-      this._draggingPos = true;
-      offsetInfo.textContent = `@${parseFloat(posSlider.value).toFixed(2)}s`;
-    });
-    posSlider.addEventListener('change', () => {
-      this._draggingPos = false;
-      track.setOffset(parseFloat(posSlider.value));
-      refreshTiming();
-      resync();
-      this.persistTrack(track);
-    });
-
     repeatSel.addEventListener('change', () => {
       track.setRepeat(repeatSel.value);
+      lane.draw();
       resync();
       this.persistTrack(track);
     });
@@ -1478,6 +1720,7 @@ class LooperApp {
 }
 
 window.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('.app-version').forEach((el) => { el.textContent = 'v' + APP_VERSION; });
   window.looperApp = new LooperApp();
 
   if ('serviceWorker' in navigator) {

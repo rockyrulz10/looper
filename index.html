@@ -17,7 +17,7 @@
   <div id="splash">
     <div class="splash-inner">
       <div class="splash-logo">◉</div>
-      <h1>Looper <span class="app-version">v11</span></h1>
+      <h1>Looper <span class="app-version">v1.0.0</span></h1>
       <p>Record. Layer. Loop.</p>
       <button id="btnEnable" class="btn-primary">Start</button>
       <p class="splash-hint">Microphone access is requested on your first recording.</p>
@@ -26,7 +26,7 @@
   </div>
 
   <header class="app-header">
-    <h1>Looper <span class="app-version" id="versionBadge">v11</span></h1>
+    <h1>Looper <span class="app-version" id="versionBadge">v1.0.0</span></h1>
     <div class="header-actions">
       <button id="btnPlayStop" class="btn-icon btn-playstop" aria-label="Play or stop all loops">▶</button>
       <button id="btnMenu" class="btn-icon" aria-label="Menu">⋯</button>
@@ -76,30 +76,28 @@
         <span class="track-len"></span>
         <button class="btn-chip btn-mute" title="Mute">M</button>
         <button class="btn-chip btn-solo" title="Solo">S</button>
-        <button class="btn-chip btn-expand" title="Track settings" aria-label="Track settings">▾</button>
+        <button class="btn-chip btn-expand" title="Edit loop" aria-label="Edit loop">▾</button>
       </div>
-      <canvas class="track-waveform"></canvas>
+      <canvas class="track-lane" title="Drag to move this loop in the cycle"></canvas>
       <div class="track-details">
+        <div class="detail-head">Trim loop <span class="track-loop-info"></span></div>
+        <canvas class="track-waveform"></canvas>
         <div class="track-loop-row">
           <div class="nudge-group" aria-label="Fine-trim loop start">
             <span class="nudge-label">Start</span>
             <button class="nudge" data-edge="start" data-delta="-0.01" aria-label="Start earlier">−</button>
             <button class="nudge" data-edge="start" data-delta="0.01" aria-label="Start later">+</button>
           </div>
-          <div class="track-loop-info"></div>
+          <div class="nudge-group" aria-label="Fine-move this loop in the cycle">
+            <span class="nudge-label">Place</span>
+            <button class="nudge" data-edge="offset" data-delta="-0.01" title="0.01s earlier">◀</button>
+            <span class="track-offset-info">@0.00s</span>
+            <button class="nudge" data-edge="offset" data-delta="0.01" title="0.01s later">▶</button>
+          </div>
           <div class="nudge-group" aria-label="Fine-trim loop end">
             <span class="nudge-label">End</span>
             <button class="nudge" data-edge="end" data-delta="-0.01" aria-label="End earlier">−</button>
             <button class="nudge" data-edge="end" data-delta="0.01" aria-label="End later">+</button>
-          </div>
-        </div>
-        <div class="track-timing-row">
-          <div class="pos-group" aria-label="Where in the master cycle this loop plays">
-            <span class="nudge-label">Place</span>
-            <button class="nudge" data-edge="offset" data-delta="-0.01" title="0.01s earlier">◀</button>
-            <input class="track-pos" type="range" min="0" max="1" step="0.01" value="0" />
-            <button class="nudge" data-edge="offset" data-delta="0.01" title="0.01s later">▶</button>
-            <span class="track-offset-info">@0.00s</span>
           </div>
         </div>
         <div class="track-timing-row">
