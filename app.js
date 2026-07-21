@@ -35,10 +35,12 @@ function encodeWav(float32Array, sampleRate) {
 
 // Single source of truth for the app version (semver). Keep CACHE_NAME in
 // sw.js in sync — patch = fixes, minor = features, major = reworks.
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 
-// Accent colors cycled across tracks (dot, waveform tint, sliders).
-const TRACK_PALETTE = ['#6ee7ff', '#f0abfc', '#86efac', '#fcd34d', '#fda4af', '#a5b4fc', '#5eead4', '#fdba74'];
+// Bold, Jam-Looper-style track colors. Mid-saturated so a full-color card
+// still reads white text; each track's card, lane tiles and waveform take
+// its color.
+const TRACK_PALETTE = ['#ef6d66', '#4e86f5', '#17b79e', '#8a7bf0', '#e85fa0', '#3da96e', '#e08a4e', '#35a5db'];
 
 // ---------------------------------------------------------------------------
 // Track — one loopable recording with its own trim (loopStart/loopEnd),
