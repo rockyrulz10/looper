@@ -35,7 +35,7 @@ function encodeWav(float32Array, sampleRate) {
 
 // Single source of truth for the app version (semver). Keep CACHE_NAME in
 // sw.js in sync — patch = fixes, minor = features, major = reworks.
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.3.0';
 
 // Bold, Jam-Looper-style track colors. Mid-saturated so a full-color card
 // still reads white text; each track's card, lane tiles and waveform take
@@ -310,6 +310,100 @@ class Track {
 }
 
 // ---------------------------------------------------------------------------
+// Sample — a one-shot clip in the pad bank. Trigger it live, edit/trim it,
+// or drop it into the arrangement (which spins up a one-shot track from it).
+// ---------------------------------------------------------------------------
+let sampleIdCounter = 0;
+
+class Sample {
+  constructor(engine, opts = {}) {
+    this.engine = engine;
+    this.id = opts.id || `sample-${Date.now()}-${sampleIdCounter++}`;
+    this.slot = opts.slot ?? 0;
+    this.name = opts.name || `Pad ${this.slot + 1}`;
+    this.color = opts.color || TRACK_PALETTE[this.slot % TRACK_PALETTE.length];
+    this.buffer = opts.buffer || null;
+    this.loopStart = opts.loopStart ?? 0;
+    this.loopEnd = opts.loopEnd ?? (opts.buffer ? opts.buffer.duration : 0);
+    this.volume = opts.volume ?? 1;
+    this.sourceNode = null;
+  }
+
+  setBuffer(buf) {
+    this.buffer = buf;
+    this.loopStart = 0;
+    this.loopEnd = buf.duration;
+  }
+
+  setLoopPoints(start, end) {
+    if (!this.buffer) return;
+    const minGap = 0.02;
+    const dur = this.buffer.duration;
+    start = Math.max(0, Math.min(start, dur - minGap));
+    end = Math.max(start + minGap, Math.min(end, dur));
+    this.loopStart = start;
+    this.loopEnd = end;
+  }
+
+  // Trimmed region with tiny declick edges — used for one-shot playback,
+  // WAV export and building a track from the sample.
+  renderRegion() {
+    const sr = this.buffer.sampleRate;
+    const s = Math.max(0, Math.floor(this.loopStart * sr));
+    const e = Math.min(Math.floor(this.loopEnd * sr), this.buffer.length);
+    const len = Math.max(1, e - s);
+    const out = new Float32Array(len);
+    out.set(this.buffer.getChannelData(0).subarray(s, e));
+    const F = Math.min(Math.floor(0.004 * sr), Math.floor(len / 2));
+    for (let j = 0; j < F; j++) { const g = j / F; out[j] *= g; out[len - 1 - j] *= g; }
+    return { out, sr };
+  }
+
+  play() {
+    if (!this.buffer) return;
+    const ctx = this.engine.audioContext;
+    this.stop();
+    const { out, sr } = this.renderRegion();
+    const buf = ctx.createBuffer(1, out.length, sr);
+    buf.copyToChannel(out, 0);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const g = ctx.createGain();
+    g.gain.value = this.volume;
+    src.connect(g);
+    g.connect(this.engine.masterGain);
+    src.start();
+    src.onended = () => { if (this.sourceNode === src) this.sourceNode = null; };
+    this.sourceNode = src;
+  }
+
+  stop() {
+    if (this.sourceNode) {
+      try { this.sourceNode.stop(); } catch (e) { /* noop */ }
+      this.sourceNode = null;
+    }
+  }
+
+  // One-shots have no cycle position — lets WaveformEditor treat a Sample
+  // like a Track (it draws a playhead only when this returns non-null).
+  playheadTime() { return null; }
+
+  toStorageRecord() {
+    return {
+      id: this.id,
+      slot: this.slot,
+      name: this.name,
+      color: this.color,
+      sampleRate: this.buffer ? this.buffer.sampleRate : 44100,
+      channelData: this.buffer ? this.buffer.getChannelData(0).slice().buffer : null,
+      loopStart: this.loopStart,
+      loopEnd: this.loopEnd,
+      volume: this.volume,
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // AudioEngine — mic capture (via AudioWorklet) + playback graph.
 // ---------------------------------------------------------------------------
 class AudioEngine {
@@ -322,7 +416,9 @@ class AudioEngine {
     this._timelineWall = null; // same epoch in wall-clock ms — survives context rebuilds
     this._stallTicks = 0;
     this._rebuilding = false;
-    this.recordingTrack = null;
+    this.recordingTrack = null;   // loop currently being recorded (or null)
+    this.capturing = false;       // mic capture pipeline is active
+    this.samples = [];            // pad-bank one-shot samples
     this.recordedChunks = [];
     this.recordedLength = 0;
     this.initialized = false;
@@ -434,6 +530,14 @@ class AudioEngine {
         t.buffer = nb;
       }
     }
+    for (const s of this.samples) {
+      s.stop();
+      if (s.buffer) {
+        const nb = this.audioContext.createBuffer(1, s.buffer.length, s.buffer.sampleRate);
+        nb.copyToChannel(s.buffer.getChannelData(0), 0);
+        s.buffer = nb;
+      }
+    }
   }
 
   async init() {
@@ -541,7 +645,7 @@ class AudioEngine {
     const data = new Uint8Array(128); // fftSize 256 → 128 bins
     const loop = () => {
       let peak = 0;
-      if (this._captureAnalyser && this.recordingTrack) {
+      if (this._captureAnalyser && this.capturing) {
         this._captureAnalyser.getByteTimeDomainData(data);
         for (let i = 0; i < data.length; i++) {
           const v = Math.abs(data[i] - 128) / 128;
@@ -555,7 +659,7 @@ class AudioEngine {
   }
 
   _onWorkletChunk(chunk) {
-    if (!this.recordingTrack) return;
+    if (!this.capturing) return;
     this.recordedChunks.push(chunk);
     this.recordedLength += chunk.length;
   }
@@ -571,7 +675,9 @@ class AudioEngine {
     return track;
   }
 
-  async startRecording(track) {
+  // Generic mic capture — used for both loop recording and sample recording.
+  // Returns nothing; call stopCapture() to get the recorded AudioBuffer.
+  async startCapture() {
     this._ensureOutput();
     // Grab the mic only for the duration of the take — holding it open keeps
     // iOS in call-mode routing and away from the Bluetooth A2DP output.
@@ -590,13 +696,7 @@ class AudioEngine {
     this._captureSource.connect(this._captureNode);
     this.recordedChunks = [];
     this.recordedLength = 0;
-    this.recordingTrack = track;
-    // Remember WHERE in the running cycle this take began, so the new loop
-    // defaults to playing back at the position it was performed at.
-    const L = this.masterLen();
-    this._recStartOffset = (this.timelineStart != null && L > 0)
-      ? (((this.audioContext.currentTime - this.timelineStart) % L) + L) % L
-      : null;
+    this.capturing = true;
     this._captureNode.port.postMessage('start');
     // iOS route flips when the mic opens can suspend the PLAYBACK context —
     // keep kicking it so existing loops keep playing under the overdub. If
@@ -624,21 +724,19 @@ class AudioEngine {
     }, 300);
   }
 
-  async stopRecording() {
+  async stopCapture() {
     if (this._recWatchdog) {
       clearInterval(this._recWatchdog);
       this._recWatchdog = null;
     }
-    if (!this.recordingTrack) {
+    if (!this.capturing) {
       this._releaseMic();
       return null;
     }
     this._captureNode.port.postMessage('stop');
     // Give the worklet a moment to flush its final chunk over the port.
     await new Promise((r) => setTimeout(r, 150));
-
-    const track = this.recordingTrack;
-    this.recordingTrack = null;
+    this.capturing = false;
     const recSampleRate = this._captureCtx.sampleRate;
     const merged = new Float32Array(this.recordedLength);
     let offset = 0;
@@ -661,6 +759,31 @@ class AudioEngine {
       recSampleRate
     );
     audioBuffer.copyToChannel(merged, 0);
+    return audioBuffer;
+  }
+
+  async startRecording(track) {
+    this.recordingTrack = track;
+    // Remember WHERE in the running cycle this take began, so the new loop
+    // defaults to playing back at the position it was performed at.
+    const L = this.masterLen();
+    this._recStartOffset = (this.timelineStart != null && L > 0)
+      ? (((this.audioContext.currentTime - this.timelineStart) % L) + L) % L
+      : null;
+    try {
+      await this.startCapture();
+    } catch (err) {
+      this.recordingTrack = null;
+      throw err;
+    }
+  }
+
+  async stopRecording() {
+    const track = this.recordingTrack;
+    this.recordingTrack = null;
+    const audioBuffer = await this.stopCapture();
+    if (!track) return null;
+    if (!audioBuffer) return track;
     const lenBefore = this.masterLen(); // cycle length set by OTHER tracks
     track.setBuffer(audioBuffer);
     // An overdub shorter than the cycle lands where it was performed; a take
@@ -703,6 +826,11 @@ class AudioEngine {
   playTrack(track) {
     this._ensureOutput();
     track.playSynced(); // joins the running cycle (or starts one)
+  }
+
+  playSample(sample) {
+    this._ensureOutput();
+    sample.play();
   }
 
   stopAll() {
@@ -1111,18 +1239,22 @@ class TimelineLane {
       }
     }
 
-    // Right-edge loop handle (drag to add/remove repeats).
-    const hx = this.timeToX(extentEnd);
-    ctx.fillStyle = '#fff';
-    this._roundRect(ctx, hx - 4 * dpr, bodyY + 6, 8 * dpr, bodyH - 12, 3 * dpr);
-    ctx.fill();
-    ctx.strokeStyle = this._tint(accent, 0.5);
-    ctx.lineWidth = 1;
-    for (let g = -1; g <= 1; g++) {
-      const gy = mid + g * 4 * dpr;
-      ctx.beginPath();
-      ctx.moveTo(hx - 1.5 * dpr, gy); ctx.lineTo(hx + 1.5 * dpr, gy); ctx.stroke();
-    }
+    // Edge handles: left = trim from front, right = set repeats (loop).
+    const drawHandle = (cx) => {
+      const hx = Math.max(4 * dpr, Math.min(cx, w - 4 * dpr));
+      ctx.fillStyle = '#fff';
+      this._roundRect(ctx, hx - 4 * dpr, bodyY + 6, 8 * dpr, bodyH - 12, 3 * dpr);
+      ctx.fill();
+      ctx.strokeStyle = this._tint(accent, 0.5);
+      ctx.lineWidth = 1;
+      for (let g = -1; g <= 1; g++) {
+        const gy = mid + g * 4 * dpr;
+        ctx.beginPath();
+        ctx.moveTo(hx - 1.5 * dpr, gy); ctx.lineTo(hx + 1.5 * dpr, gy); ctx.stroke();
+      }
+    };
+    drawHandle(this.timeToX(off));         // trim-start handle
+    drawHandle(this.timeToX(extentEnd));   // loop handle
   }
 
   // Lighten a hex color toward white by amount (0..1) → rgba string.
@@ -1167,12 +1299,16 @@ class TimelineLane {
     const x = this.getX(e);
     const dpr = window.devicePixelRatio || 1;
     const lay = this._layout(L);
-    const handleX = this.timeToX(lay.extentEnd);
+    const rightX = this.timeToX(lay.extentEnd);
+    const leftX = this.timeToX(lay.off);
+    const hpx = 16 * dpr;
+    const dR = Math.abs(x - rightX), dL = Math.abs(x - leftX);
 
-    if (Math.abs(x - handleX) <= 16 * dpr) {
-      this.mode = 'loop';
+    if (dR <= hpx && dR <= dL) {
+      this.mode = 'loop';           // right edge → set repeats
+    } else if (dL <= hpx) {
+      this.mode = 'trimStart';      // left edge → trim from the front
     } else {
-      // body hit-test (wrap-aware)
       const xc = this.xToTime(x);
       const rel = (((xc - lay.off) % L) + L) % L;
       if (rel < lay.reps * lay.region) this.mode = 'move';
@@ -1183,6 +1319,7 @@ class TimelineLane {
     this.moved = false;
     this.dragStartX = x;
     this.dragOrigOffset = this.track.offset;
+    this.dragOrigLoopStart = this.track.loopStart;
     this._snapAt = null;
 
     // Snap targets for move: other tracks' tile edges + cycle quarter marks.
@@ -1229,20 +1366,40 @@ class TimelineLane {
       let reps = Math.max(1, Math.round(rel / lay.region));
       reps = Math.min(reps, lay.maxReps);
       this.track.setRepeat(reps >= lay.maxReps ? 'fill' : reps);
+    } else if (this.mode === 'trimStart') {
+      // Within the block, cycle time and buffer time share the same scale.
+      let leftCycle = this.xToTime(x);
+      const thr = (12 * (window.devicePixelRatio || 1)) / this.canvas.width * L;
+      let best = null, bd = thr;
+      for (const c of this.snaps) {
+        let d = Math.abs(leftCycle - c); d = Math.min(d, L - d);
+        if (d < bd) { bd = d; best = c; }
+      }
+      if (best != null) { leftCycle = best; this._snapAt = best; }
+      const minGap = 0.03;
+      let ns = this.dragOrigLoopStart + (leftCycle - this.dragOrigOffset);
+      ns = Math.max(0, Math.min(ns, this.track.loopEnd - minGap));
+      const applied = ns - this.dragOrigLoopStart;
+      this.track.loopStart = ns;
+      this.track._procDirty = true;
+      let no = this.dragOrigOffset + applied;
+      no = ((no % L) + L) % L;
+      this.track.offset = no;
     }
     this.draw();
-    if (this.onChange) this.onChange(false);
+    if (this.onChange) this.onChange(false, this.mode);
   }
 
   onUp(e) {
     if (!this.dragging) return;
+    const mode = this.mode;
     this.dragging = false;
     this.dragL = 0;
     this._snapAt = null;
     try { this.canvas.releasePointerCapture(e.pointerId); } catch (_) { /* noop */ }
     if (this.track.sourceNode) this.track.playSynced();
     this.draw();
-    if (this.onChange) this.onChange(true);
+    if (this.onChange) this.onChange(true, mode);
   }
 }
 
@@ -1253,8 +1410,11 @@ class LooperApp {
   constructor() {
     this.engine = new AudioEngine();
     this.trackViews = new Map();
+    this.padViews = new Map();
     this.isRecording = false;
+    this.recordingSample = null;
     this.started = false;
+    this._importTarget = 'loop';
 
     this.trackListEl = document.getElementById('trackList');
     this.trackTemplate = document.getElementById('trackTemplate');
@@ -1313,13 +1473,15 @@ class LooperApp {
     });
 
     const fileInput = document.getElementById('fileImport');
-    const openImport = async () => {
+    const openImport = (target) => async () => {
       closeMenu();
       await this.ensureStarted();
+      this._importTarget = target;
       fileInput.click();
     };
-    document.getElementById('menuImport').addEventListener('click', openImport);
-    document.getElementById('emptyImport').addEventListener('click', openImport);
+    document.getElementById('menuImportLoop').addEventListener('click', openImport('loop'));
+    document.getElementById('menuImportSample').addEventListener('click', openImport('sample'));
+    document.getElementById('emptyImport').addEventListener('click', openImport('loop'));
     document.getElementById('menuFix').addEventListener('click', async () => {
       closeMenu();
       await this.ensureStarted();
@@ -1334,8 +1496,23 @@ class LooperApp {
     fileInput.addEventListener('change', async () => {
       const files = Array.from(fileInput.files || []);
       fileInput.value = '';
-      if (files.length) await this.importFiles(files);
+      if (!files.length) return;
+      if (this._importTarget === 'sample') await this.importFilesAsSamples(files);
+      else await this.importFiles(files);
     });
+
+    // Sampler: add-pad button + the sample editor sheet (bound once; the
+    // sheet's WaveformEditor is reused across samples by swapping .track).
+    document.getElementById('padAdd').addEventListener('click', async () => {
+      await this.ensureStarted();
+      if (this.engine.samples.length >= 16) { this.flashMessage('Pad bank is full'); return; }
+      const s = new Sample(this.engine, { slot: this.engine.samples.length });
+      this.engine.samples.push(s);
+      this.renderPadBank();
+      const view = this.padViews.get(s.id);
+      if (view) view.slot.scrollIntoView({ behavior: 'smooth', inline: 'end' });
+    });
+    this._bindSampleSheet();
 
     // Diagnostics are hidden by default — tap the version badge to peek.
     document.getElementById('versionBadge').addEventListener('click', () => {
@@ -1387,7 +1564,7 @@ class LooperApp {
       const e = this.engine;
       if (!e.audioContext) return;
       const sess = 'audioSession' in navigator ? navigator.audioSession.type : 'n/a';
-      const rec = e.recordingTrack ? 'REC' : 'idle';
+      const rec = e.capturing ? 'REC' : 'idle';
       el.textContent =
         `out:${e.audioContext.state} · ${rec} · session:${sess} · cycle:${e.masterLen().toFixed(2)}s`;
     }, 500);
@@ -1403,6 +1580,11 @@ class LooperApp {
 
     const transport = document.getElementById('transport');
     if (!this.isRecording) {
+      // The mic pipeline is shared with pad recording — one take at a time.
+      if (this.engine.capturing) {
+        this.flashMessage('Finish the sample recording first');
+        return;
+      }
       const track = this.engine.createTrack();
       this._pendingTrack = track;
       this.isRecording = true;
@@ -1445,26 +1627,31 @@ class LooperApp {
     }
   }
 
+  // Decode any audio file to a mono AudioBuffer matching the recording
+  // pipeline and storage format.
+  async _decodeFileToMono(file) {
+    const arrayBuf = await file.arrayBuffer();
+    const decoded = await this.engine.audioContext.decodeAudioData(arrayBuf);
+    const len = decoded.length;
+    const mono = new Float32Array(len);
+    for (let c = 0; c < decoded.numberOfChannels; c++) {
+      const d = decoded.getChannelData(c);
+      for (let i = 0; i < len; i++) mono[i] += d[i];
+    }
+    if (decoded.numberOfChannels > 1) {
+      const scale = 1 / decoded.numberOfChannels;
+      for (let i = 0; i < len; i++) mono[i] *= scale;
+    }
+    const buf = this.engine.audioContext.createBuffer(1, Math.max(1, len), decoded.sampleRate);
+    buf.copyToChannel(mono, 0);
+    return buf;
+  }
+
   async importFiles(files) {
     let imported = 0;
     for (const file of files) {
       try {
-        const arrayBuf = await file.arrayBuffer();
-        const decoded = await this.engine.audioContext.decodeAudioData(arrayBuf);
-        // Mix down to mono to match the recording pipeline and storage format.
-        const len = decoded.length;
-        const mono = new Float32Array(len);
-        for (let c = 0; c < decoded.numberOfChannels; c++) {
-          const d = decoded.getChannelData(c);
-          for (let i = 0; i < len; i++) mono[i] += d[i];
-        }
-        if (decoded.numberOfChannels > 1) {
-          const scale = 1 / decoded.numberOfChannels;
-          for (let i = 0; i < len; i++) mono[i] *= scale;
-        }
-        const buf = this.engine.audioContext.createBuffer(1, Math.max(1, len), decoded.sampleRate);
-        buf.copyToChannel(mono, 0);
-
+        const buf = await this._decodeFileToMono(file);
         const track = this.engine.createTrack();
         track.name = file.name.replace(/\.[^.]+$/, '').slice(0, 30) || track.name;
         track.setBuffer(buf);
@@ -1480,6 +1667,309 @@ class LooperApp {
       this.cycleChanged();
       this.flashMessage(`Imported ${imported} file(s) — trim the loop region, then hit play`);
     }
+  }
+
+  async importFilesAsSamples(files) {
+    let imported = 0;
+    for (const file of files) {
+      try {
+        const buf = await this._decodeFileToMono(file);
+        // Reuse the first empty pad; add a new one if the bank is all filled.
+        let sample = this.engine.samples.find((s) => !s.buffer);
+        if (!sample) {
+          if (this.engine.samples.length >= 16) { this.flashMessage('Pad bank is full'); break; }
+          sample = new Sample(this.engine, { slot: this.engine.samples.length });
+          this.engine.samples.push(sample);
+        }
+        sample.name = file.name.replace(/\.[^.]+$/, '').slice(0, 30) || sample.name;
+        sample.setBuffer(buf);
+        this.persistSample(sample);
+        imported++;
+      } catch (err) {
+        console.error('sample import failed', file.name, err);
+        this.flashMessage(`Couldn't import ${file.name} — unsupported format?`);
+      }
+    }
+    if (imported) {
+      this.renderPadBank();
+      this.flashMessage(`Imported ${imported} sample(s) — tap a pad to play`);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Sampler: pad bank + editor sheet
+  // Pad gestures: tap empty = record · tap filled = play · hold = edit ·
+  // drag a filled pad onto the track list = add to the arrangement.
+  // -------------------------------------------------------------------------
+
+  persistSample(sample) {
+    if (!sample.buffer) return;
+    Storage.saveSample(sample.toStorageRecord()).catch((e) => console.error('sample save failed', e));
+  }
+
+  renderPadBank() {
+    const bank = document.getElementById('padBank');
+    bank.innerHTML = '';
+    this.padViews.clear();
+    for (const sample of this.engine.samples) this._renderPad(bank, sample);
+  }
+
+  _updatePadUI(sample) {
+    const view = this.padViews.get(sample.id);
+    if (!view) return;
+    const recording = this.recordingSample === sample;
+    view.pad.classList.toggle('filled', !!sample.buffer && !recording);
+    view.pad.classList.toggle('recording', recording);
+    view.pad.textContent = recording ? '■' : sample.buffer ? '▶' : '＋';
+    view.pad.style.setProperty('--pcolor', sample.color);
+    view.nameEl.textContent = sample.name;
+    view.nameEl.classList.toggle('set', !!sample.buffer);
+  }
+
+  _renderPad(bank, sample) {
+    const slot = document.createElement('div');
+    slot.className = 'pad-slot';
+    const pad = document.createElement('button');
+    pad.className = 'pad';
+    const nameEl = document.createElement('div');
+    nameEl.className = 'pad-name';
+    slot.appendChild(pad);
+    slot.appendChild(nameEl);
+    bank.appendChild(slot);
+    this.padViews.set(sample.id, { slot, pad, nameEl });
+    this._updatePadUI(sample);
+    this._bindPadInteractions(pad, sample);
+  }
+
+  _bindPadInteractions(pad, sample) {
+    const HOLD_MS = 480;
+    const DRAG_PX = 12;
+    const ghost = document.getElementById('dragGhost');
+
+    pad.addEventListener('pointerdown', (e) => {
+      let holdFired = false;
+      let dragMode = false;
+      const startX = e.clientX;
+      const startY = e.clientY;
+      try { pad.setPointerCapture(e.pointerId); } catch (_) { /* noop */ }
+
+      // Long-press → edit sheet (filled pads only).
+      const holdTimer = setTimeout(() => {
+        if (dragMode || !sample.buffer) return;
+        holdFired = true;
+        this.openSampleSheet(sample);
+      }, HOLD_MS);
+
+      const onMove = (ev) => {
+        const dx = ev.clientX - startX;
+        const dy = ev.clientY - startY;
+        if (!dragMode && Math.hypot(dx, dy) > DRAG_PX) {
+          clearTimeout(holdTimer);
+          if (!sample.buffer || this.recordingSample) return;
+          dragMode = true;
+          ghost.textContent = `▶ ${sample.name}`;
+          ghost.classList.remove('hidden');
+        }
+        if (dragMode) {
+          ghost.style.left = `${ev.clientX + 12}px`;
+          ghost.style.top = `${ev.clientY - 14}px`;
+          const under = document.elementFromPoint(ev.clientX, ev.clientY);
+          const overTracks = !!(under && under.closest('#trackList, .track-card, #emptyState'));
+          this.trackListEl.classList.toggle('drop-target', overTracks);
+        }
+      };
+
+      const onUp = (ev) => {
+        clearTimeout(holdTimer);
+        pad.removeEventListener('pointermove', onMove);
+        pad.removeEventListener('pointerup', onUp);
+        pad.removeEventListener('pointercancel', onCancel);
+        if (dragMode) {
+          ghost.classList.add('hidden');
+          const wasOver = this.trackListEl.classList.contains('drop-target');
+          this.trackListEl.classList.remove('drop-target');
+          const under = document.elementFromPoint(ev.clientX, ev.clientY);
+          if (wasOver || (under && under.closest('#trackList, .track-card, #emptyState'))) {
+            this.addSampleToArrangement(sample);
+          }
+          return;
+        }
+        if (holdFired) return;
+        // Plain tap.
+        if (this.recordingSample === sample || !sample.buffer) {
+          this.toggleSampleRecord(sample);
+        } else {
+          this.engine.playSample(sample);
+          pad.classList.add('active');
+          setTimeout(() => pad.classList.remove('active'), 140);
+        }
+      };
+
+      const onCancel = () => {
+        clearTimeout(holdTimer);
+        ghost.classList.add('hidden');
+        this.trackListEl.classList.remove('drop-target');
+        pad.removeEventListener('pointermove', onMove);
+        pad.removeEventListener('pointerup', onUp);
+        pad.removeEventListener('pointercancel', onCancel);
+      };
+
+      pad.addEventListener('pointermove', onMove);
+      pad.addEventListener('pointerup', onUp);
+      pad.addEventListener('pointercancel', onCancel);
+    });
+  }
+
+  async toggleSampleRecord(sample) {
+    try {
+      await this.ensureStarted();
+    } catch (err) {
+      return;
+    }
+    if (this.recordingSample === sample) {
+      // Stop this pad's take.
+      const buf = await this.engine.stopCapture();
+      this.recordingSample = null;
+      this._updatePadUI(sample);
+      if (!buf || buf.duration < 0.05) {
+        this.flashMessage('Recording too short — try again');
+        return;
+      }
+      sample.setBuffer(buf);
+      this._updatePadUI(sample);
+      this.persistSample(sample);
+      return;
+    }
+    if (this.engine.capturing || this.isRecording) {
+      this.flashMessage('Already recording — stop that first');
+      return;
+    }
+    try {
+      await this.engine.startCapture();
+    } catch (err) {
+      this.flashMessage('Could not access microphone — check Safari mic permission');
+      return;
+    }
+    this.recordingSample = sample;
+    this._updatePadUI(sample);
+  }
+
+  // Turn the pad's trimmed region into a regular track in the arrangement.
+  addSampleToArrangement(sample) {
+    if (!sample.buffer) return;
+    const { out, sr } = sample.renderRegion();
+    const buf = this.engine.audioContext.createBuffer(1, out.length, sr);
+    buf.copyToChannel(out, 0);
+    const track = this.engine.createTrack();
+    track.name = sample.name;
+    track.setBuffer(buf);
+    const hadCycle = this.engine.masterLen() > 0 &&
+      this.engine.tracks.some((t) => t !== track && t.buffer);
+    if (hadCycle) {
+      // Joining an existing cycle: land as a one-shot at the live playhead
+      // (or 0 when stopped) instead of tiling over everything.
+      track.setRepeat(1);
+      const e = this.engine;
+      if (e.timelineStart != null && e.audioContext) {
+        const L = e.masterLen();
+        if (L > 0) {
+          const pos = (((e.audioContext.currentTime - e.timelineStart) % L) + L) % L;
+          track.setOffset(pos);
+        }
+      }
+    }
+    this.addTrackView(track);
+    this.cycleChanged();
+    this.persistTrack(track);
+    if (this.engine.anyPlaying()) track.playSynced();
+    this.flashMessage(`"${sample.name}" added to the arrangement`);
+  }
+
+  _bindSampleSheet() {
+    const sheet = document.getElementById('sampleSheet');
+    const nameInput = document.getElementById('sampleName');
+    const volSlider = document.getElementById('sampleVol');
+    const waveCanvas = document.getElementById('sampleWave');
+
+    // One editor for the sheet's lifetime; .track is swapped per sample.
+    this._sheetEditor = new WaveformEditor(waveCanvas, { buffer: null }, (final) => {
+      if (final && this._sheetSample) this.persistSample(this._sheetSample);
+    });
+
+    const close = () => {
+      sheet.classList.add('hidden');
+      if (this._sheetSample) {
+        this._sheetSample.stop();
+        this._updatePadUI(this._sheetSample);
+      }
+      this._sheetSample = null;
+    };
+    document.getElementById('sampleClose').addEventListener('click', close);
+    sheet.addEventListener('click', (ev) => { if (ev.target === sheet) close(); });
+
+    document.getElementById('samplePlay').addEventListener('click', () => {
+      if (this._sheetSample) this.engine.playSample(this._sheetSample);
+    });
+
+    nameInput.addEventListener('change', () => {
+      const s = this._sheetSample;
+      if (!s) return;
+      s.name = nameInput.value || s.name;
+      this._updatePadUI(s);
+      this.persistSample(s);
+    });
+
+    volSlider.addEventListener('input', () => {
+      if (this._sheetSample) this._sheetSample.volume = parseFloat(volSlider.value);
+    });
+    volSlider.addEventListener('change', () => {
+      if (this._sheetSample) this.persistSample(this._sheetSample);
+    });
+
+    document.getElementById('sampleToTrack').addEventListener('click', () => {
+      const s = this._sheetSample;
+      if (!s) return;
+      close();
+      this.addSampleToArrangement(s);
+    });
+
+    document.getElementById('sampleDownload').addEventListener('click', () => {
+      const s = this._sheetSample;
+      if (!s || !s.buffer) return;
+      const { out, sr } = s.renderRegion();
+      const blob = encodeWav(out, sr);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${s.name.replace(/\s+/g, '_')}.wav`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+    });
+
+    document.getElementById('sampleDelete').addEventListener('click', () => {
+      const s = this._sheetSample;
+      if (!s) return;
+      if (!confirm(`Delete sample "${s.name}"?`)) return;
+      s.stop();
+      s.buffer = null;
+      s.loopStart = 0;
+      s.loopEnd = 0;
+      s.name = `Pad ${s.slot + 1}`;
+      Storage.deleteSample(s.id).catch((e) => console.error(e));
+      close();
+      this._updatePadUI(s);
+    });
+  }
+
+  openSampleSheet(sample) {
+    this._sheetSample = sample;
+    document.getElementById('sampleName').value = sample.name;
+    document.getElementById('sampleVol').value = sample.volume;
+    this._sheetEditor.track = sample;
+    document.getElementById('sampleSheet').classList.remove('hidden');
+    requestAnimationFrame(() => this._sheetEditor.resizeAndDraw());
   }
 
   updateLevelMeter(level) {
@@ -1564,12 +2054,14 @@ class LooperApp {
       }
     });
 
-    // Arrange: drag the block to move it; drag its right edge to set repeats.
-    const lane = new TimelineLane(laneCanvas, track, this, (final) => {
+    // Arrange: drag body = move, right edge = repeats, left edge = trim front.
+    const lane = new TimelineLane(laneCanvas, track, this, (final, mode) => {
       updateOffsetInfo();
       repeatSel.value = String(track.repeat);
+      if (mode === 'trimStart') { updateInfo(); editor.draw(); }
       if (final) {
-        refreshTiming();
+        if (mode === 'trimStart') this.cycleChanged(); // region changed
+        else refreshTiming();
         this.persistTrack(track);
       }
     });
@@ -1588,6 +2080,47 @@ class LooperApp {
     }
 
     expandBtn.addEventListener('click', () => node.classList.toggle('open'));
+
+    // Drag the grip to reorder cards. Purely visual/order metadata — the
+    // audio graph doesn't care about display order.
+    const grip = node.querySelector('.track-grip');
+    grip.style.touchAction = 'none';
+    grip.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      try { grip.setPointerCapture(e.pointerId); } catch (_) { /* noop */ }
+      node.classList.add('dragging');
+
+      const onMove = (ev) => {
+        const under = document.elementFromPoint(ev.clientX, ev.clientY);
+        const target = under && under.closest('.track-card');
+        if (!target || target === node || target.parentElement !== this.trackListEl) return;
+        const r = target.getBoundingClientRect();
+        if (ev.clientY < r.top + r.height / 2) this.trackListEl.insertBefore(node, target);
+        else this.trackListEl.insertBefore(node, target.nextSibling);
+      };
+
+      const onUp = () => {
+        grip.removeEventListener('pointermove', onMove);
+        grip.removeEventListener('pointerup', onUp);
+        grip.removeEventListener('pointercancel', onUp);
+        node.classList.remove('dragging');
+        // Commit the new visual order to track.order + storage.
+        const cards = Array.from(this.trackListEl.children);
+        this.trackViews.forEach((view, id) => {
+          const t = this.engine.tracks.find((tr) => tr.id === id);
+          if (!t) return;
+          const idx = cards.indexOf(view.root);
+          if (idx >= 0 && t.order !== idx) {
+            t.order = idx;
+            this.persistTrack(t);
+          }
+        });
+      };
+
+      grip.addEventListener('pointermove', onMove);
+      grip.addEventListener('pointerup', onUp);
+      grip.addEventListener('pointercancel', onUp);
+    });
 
     nameInput.addEventListener('change', () => {
       track.name = nameInput.value || track.name;
@@ -1782,15 +2315,53 @@ class LooperApp {
       this.cycleChanged();
       this.flashMessage(`Restored ${records.length} track(s)`);
     }
+    await this.restoreSamples();
+  }
+
+  async restoreSamples() {
+    let records = [];
+    try {
+      records = await Storage.loadAllSamples();
+    } catch (e) {
+      console.error('sample restore failed', e);
+    }
+    for (const rec of records) {
+      if (!rec.channelData) continue;
+      const sample = new Sample(this.engine, {
+        id: rec.id,
+        slot: rec.slot,
+        name: rec.name,
+        color: rec.color,
+        volume: rec.volume,
+      });
+      const floatArr = new Float32Array(rec.channelData);
+      const buf = this.engine.audioContext.createBuffer(1, Math.max(1, floatArr.length), rec.sampleRate);
+      buf.copyToChannel(floatArr, 0);
+      sample.buffer = buf;
+      sample.loopStart = rec.loopStart;
+      sample.loopEnd = rec.loopEnd;
+      this.engine.samples.push(sample);
+    }
+    // Always show a few ready-to-record pads.
+    while (this.engine.samples.length < 4) {
+      this.engine.samples.push(new Sample(this.engine, { slot: this.engine.samples.length }));
+    }
+    this.renderPadBank();
   }
 
   async clearSession() {
-    if (!this.engine.tracks.length) return;
-    if (!confirm('Delete all tracks? This cannot be undone.')) return;
+    if (!this.engine.tracks.length && !this.engine.samples.some((s) => s.buffer)) return;
+    if (!confirm('Delete all tracks and samples? This cannot be undone.')) return;
     this.engine.stopAll();
     for (const t of [...this.engine.tracks]) this.engine.removeTrack(t);
     this.trackListEl.innerHTML = '';
     this.trackViews.clear();
+    this.engine.samples.forEach((s) => s.stop());
+    this.engine.samples = [];
+    while (this.engine.samples.length < 4) {
+      this.engine.samples.push(new Sample(this.engine, { slot: this.engine.samples.length }));
+    }
+    this.renderPadBank();
     this.updateEmptyState();
     this.updatePlayStopButton();
     await Storage.clearAll();

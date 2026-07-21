@@ -16,23 +16,24 @@
 <body>
   <div id="splash">
     <div class="splash-inner">
-      <div class="splash-logo">◉</div>
-      <h1>Looper <span class="app-version">v1.2.0</span></h1>
-      <p>Record. Layer. Loop.</p>
-      <button id="btnEnable" class="btn-primary">Start</button>
-      <p class="splash-hint">Microphone access is requested on your first recording.</p>
+      <div class="splash-disc"><span class="splash-dot"></span></div>
+      <h1>Looper <span class="app-version">v1.3.0</span></h1>
+      <p class="splash-tag">Record loops · trigger samples · jam</p>
+      <button id="btnEnable" class="btn-primary">Start Jamming</button>
+      <p class="splash-hint">Microphone access is requested the first time you record.</p>
       <p id="splashError" class="splash-error"></p>
     </div>
   </div>
 
   <header class="app-header">
-    <h1>Looper <span class="app-version" id="versionBadge">v1.2.0</span></h1>
+    <h1>Looper <span class="app-version" id="versionBadge">v1.3.0</span></h1>
     <div class="header-actions">
       <button id="btnPlayStop" class="btn-icon btn-playstop" aria-label="Play or stop all loops">▶</button>
       <button id="btnMenu" class="btn-icon" aria-label="Menu">⋯</button>
     </div>
     <div id="menu" class="menu hidden">
-      <button id="menuImport">⭱&nbsp; Import audio</button>
+      <button id="menuImportLoop">⭱&nbsp; Import as loop</button>
+      <button id="menuImportSample">⭯&nbsp; Import as sample</button>
       <button id="menuFix">↻&nbsp; Fix audio</button>
       <button id="menuClear" class="menu-danger">✕&nbsp; Clear session</button>
     </div>
@@ -46,6 +47,15 @@
     <p>Tap the button below to record<br />your first loop</p>
     <button id="emptyImport" class="btn-link">or import an audio file</button>
   </div>
+
+  <section id="sampler" class="sampler">
+    <div class="sampler-head">
+      <span class="sampler-title">◇ Samples</span>
+      <span class="sampler-hint">tap to record · tap to play · hold to edit · drag into a track</span>
+      <button id="padAdd" class="pad-add-btn" title="Add a pad">＋</button>
+    </div>
+    <div id="padBank" class="pad-bank"></div>
+  </section>
 
   <footer class="transport" id="transport">
     <div class="level-meter"><div id="levelMeterFill" class="level-meter-fill"></div></div>
@@ -63,6 +73,30 @@
 
   <div id="toast" class="toast"></div>
 
+  <!-- Sample editor sheet -->
+  <div id="sampleSheet" class="sheet hidden">
+    <div class="sheet-card">
+      <div class="sheet-head">
+        <input id="sampleName" class="sheet-name" type="text" maxlength="30" />
+        <button id="sampleClose" class="btn-chip" aria-label="Close">✕</button>
+      </div>
+      <canvas id="sampleWave" class="sheet-wave" title="Drag the edges to trim"></canvas>
+      <div class="sheet-row">
+        <button id="samplePlay" class="btn-pill">▶ Play</button>
+        <div class="vol-group"><span class="nudge-label">Vol</span>
+          <input id="sampleVol" type="range" min="0" max="1.5" step="0.01" /></div>
+      </div>
+      <div class="sheet-row">
+        <button id="sampleToTrack" class="btn-pill btn-pill-accent">＋ Add to arrangement</button>
+        <button id="sampleDownload" class="btn-chip" aria-label="Download">⭳</button>
+        <button id="sampleDelete" class="btn-chip btn-del" aria-label="Delete">🗑</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Floating chip shown while dragging a pad into the arrangement -->
+  <div id="dragGhost" class="drag-ghost hidden"></div>
+
   <!-- Loops a silent WAV whenever the app is active: playing file-backed
        media anchors Safari's audio session in the "media playback" category,
        which is what iOS routes to Bluetooth A2DP. -->
@@ -71,7 +105,7 @@
   <template id="trackTemplate">
     <section class="track-card">
       <div class="track-top">
-        <span class="track-dot"></span>
+        <button class="track-grip" aria-label="Drag to reorder" title="Drag to reorder">⠿</button>
         <input class="track-name" type="text" maxlength="30" />
         <span class="track-len"></span>
         <button class="btn-chip btn-mute" title="Mute">M</button>
